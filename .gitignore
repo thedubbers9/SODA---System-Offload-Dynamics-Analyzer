@@ -28,6 +28,7 @@ Thumbs.db
 soda_results/
 *.png
 *output*
+!*output_paths.sh
 *results*
 
 # Log and output files
