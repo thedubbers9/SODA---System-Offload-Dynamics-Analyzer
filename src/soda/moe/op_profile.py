@@ -203,7 +203,13 @@ def _infer_op_name(
 
     # GEMM ops: classify by expert_type and expansion direction.
     if aten_op_name in _GEMM_OPS:
-        weight_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
+        # Match the same input ordering rules used by detect.py/_compute_hbm_fields():
+        # - aten::addmm(bias, input, weight, ...) → weight is input_dims[2]
+        # - everything else → weight is input_dims[1]
+        if aten_op_name == "aten::addmm":
+            weight_shape = _normalize_shape(input_dims[2]) if len(input_dims) > 2 else []
+        else:
+            weight_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
         expanding = _is_expanding(aten_op_name, weight_shape)
 
         if expert_type == "shared_expert":
@@ -424,7 +430,13 @@ def generate_op_profile(
         is_layer_local = ops_count > 0
 
         # Position tracking: distinguishes gate_proj (pos=0) from up_proj (pos=1).
-        w_shape = tuple(_normalize_shape(input_dims[1])) if len(input_dims) > 1 and input_dims[1] else ()
+        # For aten::addmm, weight is input_dims[2] (not input_dims[1]).
+        if aten_op_name == "aten::addmm" and len(input_dims) > 2 and input_dims[2]:
+            w_shape = tuple(_normalize_shape(input_dims[2]))
+        elif len(input_dims) > 1 and input_dims[1]:
+            w_shape = tuple(_normalize_shape(input_dims[1]))
+        else:
+            w_shape = ()
         shape_key = (w_shape, expert_type)
         pos = shape_position.get(shape_key, 0)
         shape_position[shape_key] = pos + (ops_count if is_layer_local else 1)
