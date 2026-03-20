@@ -364,24 +364,28 @@ def classify_kernel_entries(
 
         signals = _compute_group_signals(entries)
 
-        # Down-projection classification guard:
-        # For shared experts, down-projection has output_dim == hidden_dim and
-        # input_dim == shared_dim. Some kernels can still show higher
-        # cardinality signals (e.g. from preceding cat/fusion behavior),
-        # which would incorrectly flip them to routed_expert. If the dims
-        # clearly match the down-projection shape, trust the dims over
-        # cardinality.
+        # Prefer structural dimension matches over cardinality.
+        #
+        # Cardinality is a strong heuristic for routed experts, but shared
+        # down-projection kernels can still exhibit elevated cardinality in
+        # some traces. Resolve known-dimension matches first, then use
+        # cardinality only as fallback for ambiguous groups.
+        if shared_dim is not None and output_dim == shared_dim:
+            group_type[weight_shape] = "shared_expert"
+            continue
+        if routed_dim is not None and output_dim == routed_dim:
+            group_type[weight_shape] = "routed_expert"
+            continue
         if hidden_dim:
-            if shared_dim is not None and any(
-                (od == hidden_dim and idim == shared_dim) for od, idim in dim_candidates
-            ):
+            if shared_dim is not None and input_dim == shared_dim and output_dim == hidden_dim:
                 group_type[weight_shape] = "shared_expert"
                 continue
-            if routed_dim is not None and any(
-                (od == hidden_dim and idim == routed_dim) for od, idim in dim_candidates
-            ):
+            if routed_dim is not None and input_dim == routed_dim and output_dim == hidden_dim:
                 group_type[weight_shape] = "routed_expert"
                 continue
+        if num_experts is not None and output_dim == num_experts:
+            group_type[weight_shape] = "gate"
+            continue
 
         # Primary signal: cardinality / variance
         if (signals["n_unique_act"] >= CARDINALITY_THRESHOLD
@@ -389,15 +393,8 @@ def classify_kernel_entries(
             group_type[weight_shape] = "routed_expert"
             continue
 
-        # Known dims from auto-detection
-        if shared_dim is not None and output_dim == shared_dim:
-            group_type[weight_shape] = "shared_expert"
-        elif routed_dim is not None and output_dim == routed_dim:
-            group_type[weight_shape] = "routed_expert"
-        elif num_experts is not None and output_dim == num_experts:
-            group_type[weight_shape] = "gate"
-        # Tiebreakers
-        elif signals["is_3d"]:
+        # Tiebreakers for remaining ambiguous groups
+        if signals["is_3d"]:
             group_type[weight_shape] = "attention"
         elif output_dim <= 1:
             group_type[weight_shape] = "other"
