@@ -190,9 +190,22 @@ def detect_moe_config(
     for weight_shape, entries in groups.items():
         signals = _compute_group_signals(entries)
         cardinality_per_group[str(list(weight_shape))] = signals["n_unique_act"]
-        # Derive GEMM output/input dims based on dominant ATen op type
-        dominant_op = entries[0].get("aten_op", {}).get("name", "")
-        output_dim, input_dim = _get_gemm_dims(weight_shape, dominant_op)
+
+        # Derive GEMM output/input dims. A single weight_shape group can
+        # contain multiple ATen op variants (e.g. aten::linear vs aten::addmm)
+        # depending on graph lowering. Use a mode vote across entries to
+        # avoid swapping (output_dim, input_dim).
+        dim_candidates = [
+            _get_gemm_dims(
+                weight_shape,
+                e.get("aten_op", {}).get("name", ""),
+            )
+            for e in entries
+        ]
+        dim_counts = {}
+        for od, idim in dim_candidates:
+            dim_counts[(od, idim)] = dim_counts.get((od, idim), 0) + 1
+        output_dim, input_dim = max(dim_counts.keys(), key=lambda k: dim_counts[k])
         group_stats.append({
             "weight_shape": weight_shape,
             "entries": entries,
@@ -319,9 +332,21 @@ def classify_kernel_entries(
     group_type: Dict[Tuple[int, ...], str] = {}
     for weight_shape, indices in groups.items():
         entries = [kernels[i] for i in indices]
-        # Derive semantic output/input dims from the op type
-        dominant_op = entries[0].get("aten_op", {}).get("name", "")
-        output_dim, input_dim = _get_gemm_dims(weight_shape, dominant_op)
+
+        # Derive semantic output/input dims from the op type. As with
+        # detect_moe_config(), this weight_shape can appear with different
+        # ATen ops depending on lowering; vote to avoid swapping dims.
+        dim_candidates = [
+            _get_gemm_dims(
+                weight_shape,
+                e.get("aten_op", {}).get("name", ""),
+            )
+            for e in entries
+        ]
+        dim_counts = {}
+        for od, idim in dim_candidates:
+            dim_counts[(od, idim)] = dim_counts.get((od, idim), 0) + 1
+        output_dim, input_dim = max(dim_counts.keys(), key=lambda k: dim_counts[k])
 
         if detection_method == "override":
             if shared_dim is not None and output_dim == shared_dim:
@@ -338,6 +363,25 @@ def classify_kernel_entries(
             continue
 
         signals = _compute_group_signals(entries)
+
+        # Down-projection classification guard:
+        # For shared experts, down-projection has output_dim == hidden_dim and
+        # input_dim == shared_dim. Some kernels can still show higher
+        # cardinality signals (e.g. from preceding cat/fusion behavior),
+        # which would incorrectly flip them to routed_expert. If the dims
+        # clearly match the down-projection shape, trust the dims over
+        # cardinality.
+        if hidden_dim:
+            if shared_dim is not None and any(
+                (od == hidden_dim and idim == shared_dim) for od, idim in dim_candidates
+            ):
+                group_type[weight_shape] = "shared_expert"
+                continue
+            if routed_dim is not None and any(
+                (od == hidden_dim and idim == routed_dim) for od, idim in dim_candidates
+            ):
+                group_type[weight_shape] = "routed_expert"
+                continue
 
         # Primary signal: cardinality / variance
         if (signals["n_unique_act"] >= CARDINALITY_THRESHOLD
