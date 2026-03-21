@@ -91,6 +91,56 @@ def _get_gemm_dims(weight_shape: Tuple[int, ...], op_name: str) -> Tuple[int, in
     return (int(weight_shape[-1]), int(weight_shape[-2]))
 
 
+def _semantic_gemm_role(
+    output_dim: int,
+    input_dim: int,
+    hidden_dim: Optional[int],
+    shared_dim: Optional[int],
+    routed_dim: Optional[int],
+    num_experts: Optional[int],
+) -> str:
+    """Classify GEMM structural role from semantic dimensions only."""
+    if hidden_dim and shared_dim:
+        if output_dim == shared_dim and input_dim == hidden_dim:
+            return "shared_expert_expand"
+        if output_dim == hidden_dim and input_dim == shared_dim:
+            return "shared_expert_down"
+
+    if hidden_dim and routed_dim:
+        if output_dim == routed_dim and input_dim == hidden_dim:
+            return "routed_expert_expand"
+        if output_dim == hidden_dim and input_dim == routed_dim:
+            return "routed_expert_down"
+
+    if hidden_dim and num_experts:
+        if output_dim == num_experts and input_dim == hidden_dim:
+            return "moe_gate"
+
+    return "unknown"
+
+
+def _is_attention_like_group(entries: List[Dict]) -> bool:
+    """Return True only when there is concrete attention-like evidence."""
+    for e in entries:
+        op_name = e.get("aten_op", {}).get("name", "")
+        input_dims = e.get("aten_op", {}).get("input_dims", [])
+        act = _get_activation_shape(e) or ()
+        weight = _get_weight_shape(e) or ()
+        if op_name == "aten::bmm":
+            return True
+        if len(act) >= 3:
+            return True
+        if len(weight) >= 3:
+            return True
+        if op_name in ("aten::matmul", "aten::_scaled_mm") and len(input_dims) >= 2:
+            lhs = input_dims[0] if len(input_dims) > 0 else []
+            rhs = input_dims[1] if len(input_dims) > 1 else []
+            if isinstance(lhs, (list, tuple)) and isinstance(rhs, (list, tuple)):
+                if len(lhs) >= 3 or len(rhs) >= 3:
+                    return True
+    return False
+
+
 def _is_gemm_entry(entry: Dict) -> bool:
     """Return True if the entry's ATen op is a GEMM-type operation."""
     return entry.get("aten_op", {}).get("name", "") in GEMM_OPS
@@ -316,8 +366,14 @@ def classify_kernel_entries(
     shared_dim = config.get("shared_dim")
     routed_dim = config.get("routed_dim")
     num_experts = config.get("num_experts")
-    hidden_dim = config.get("hidden_dim") or 1
+    hidden_dim = config.get("hidden_dim")
+    hidden_dim_for_math = hidden_dim or 1
     detection_method = config.get("detection_method", "cardinality")
+
+    print(
+        f"[moe.detect] model dims hidden_dim={hidden_dim} "
+        f"shared_dim={shared_dim} routed_dim={routed_dim} num_experts={num_experts}"
+    )
 
     # Group GEMM entries by weight shape to batch-assign types
     groups: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
@@ -328,8 +384,9 @@ def classify_kernel_entries(
         if weight_shape is not None:
             groups[weight_shape].append(idx)
 
-    # Assign expert_type per weight shape group
+    # Assign expert_type/structural_role per weight shape group
     group_type: Dict[Tuple[int, ...], str] = {}
+    group_structural_role: Dict[Tuple[int, ...], str] = {}
     for weight_shape, indices in groups.items():
         entries = [kernels[i] for i in indices]
 
@@ -348,70 +405,86 @@ def classify_kernel_entries(
             dim_counts[(od, idim)] = dim_counts.get((od, idim), 0) + 1
         output_dim, input_dim = max(dim_counts.keys(), key=lambda k: dim_counts[k])
 
+        structural_role = _semantic_gemm_role(
+            output_dim=output_dim,
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            shared_dim=shared_dim,
+            routed_dim=routed_dim,
+            num_experts=num_experts,
+        )
+        if structural_role == "unknown" and _is_attention_like_group(entries):
+            structural_role = "attention"
+
+        print(
+            f"[moe.detect] weight_shape={weight_shape} dims=({output_dim},{input_dim}) "
+            f"structural_role={structural_role}"
+        )
+
         if detection_method == "override":
-            if shared_dim is not None and output_dim == shared_dim:
+            if structural_role in ("shared_expert_expand", "shared_expert_down"):
                 group_type[weight_shape] = "shared_expert"
-            elif routed_dim is not None and output_dim == routed_dim:
+                group_structural_role[weight_shape] = structural_role
+            elif structural_role in ("routed_expert_expand", "routed_expert_down"):
                 group_type[weight_shape] = "routed_expert"
-            # Down-projection: output_dim = hidden, input_dim = intermediate
-            elif shared_dim is not None and input_dim == shared_dim:
-                group_type[weight_shape] = "shared_expert"
-            elif routed_dim is not None and input_dim == routed_dim:
-                group_type[weight_shape] = "routed_expert"
+                group_structural_role[weight_shape] = structural_role
+            elif structural_role == "moe_gate":
+                group_type[weight_shape] = "gate"
+                group_structural_role[weight_shape] = structural_role
+            elif structural_role == "attention":
+                group_type[weight_shape] = "attention"
+                group_structural_role[weight_shape] = structural_role
             else:
                 group_type[weight_shape] = "other"
+                group_structural_role[weight_shape] = "other"
             continue
 
         signals = _compute_group_signals(entries)
 
         # Prefer structural dimension matches over cardinality.
-        #
-        # Cardinality is a strong heuristic for routed experts, but shared
-        # down-projection kernels can still exhibit elevated cardinality in
-        # some traces. Resolve known-dimension matches first, then use
-        # cardinality only as fallback for ambiguous groups.
-        if shared_dim is not None and output_dim == shared_dim:
+        if structural_role in ("shared_expert_expand", "shared_expert_down"):
             group_type[weight_shape] = "shared_expert"
+            group_structural_role[weight_shape] = structural_role
             continue
-        if routed_dim is not None and output_dim == routed_dim:
+        if structural_role in ("routed_expert_expand", "routed_expert_down"):
             group_type[weight_shape] = "routed_expert"
+            group_structural_role[weight_shape] = structural_role
             continue
-        if hidden_dim:
-            if shared_dim is not None and input_dim == shared_dim and output_dim == hidden_dim:
-                group_type[weight_shape] = "shared_expert"
-                continue
-            if routed_dim is not None and input_dim == routed_dim and output_dim == hidden_dim:
-                group_type[weight_shape] = "routed_expert"
-                continue
-        if num_experts is not None and output_dim == num_experts:
+        if structural_role == "moe_gate":
             group_type[weight_shape] = "gate"
+            group_structural_role[weight_shape] = structural_role
+            continue
+        if structural_role == "attention":
+            group_type[weight_shape] = "attention"
+            group_structural_role[weight_shape] = structural_role
             continue
 
         # Primary signal: cardinality / variance
         if (signals["n_unique_act"] >= CARDINALITY_THRESHOLD
                 or signals["cv"] > CV_THRESHOLD):
             group_type[weight_shape] = "routed_expert"
+            group_structural_role[weight_shape] = "routed_expert_expand"
             continue
 
         # Tiebreakers for remaining ambiguous groups
-        if signals["is_3d"]:
+        if _is_attention_like_group(entries):
             group_type[weight_shape] = "attention"
+            group_structural_role[weight_shape] = "attention"
         elif output_dim <= 1:
             group_type[weight_shape] = "other"
+            group_structural_role[weight_shape] = "other"
         elif output_dim == hidden_dim:
-            # Down-projection: check input_dim against known intermediates
-            if shared_dim is not None and input_dim == shared_dim:
-                group_type[weight_shape] = "shared_expert"
-            elif routed_dim is not None and input_dim == routed_dim:
-                group_type[weight_shape] = "routed_expert"
-            else:
-                group_type[weight_shape] = "attention"
-        elif output_dim > 1 and output_dim <= hidden_dim // 4:
+            # Avoid over-classifying hidden-sized outputs as attention.
+            group_type[weight_shape] = "other"
+            group_structural_role[weight_shape] = "other"
+        elif output_dim > 1 and output_dim <= hidden_dim_for_math // 4:
             group_type[weight_shape] = "gate"
+            group_structural_role[weight_shape] = "moe_gate"
         else:
-            group_type[weight_shape] = "shared_expert"
+            group_type[weight_shape] = "other"
+            group_structural_role[weight_shape] = "other"
 
-    # Build annotated output (copy each entry, add expert_type)
+    # Build annotated output (copy each entry, add expert_type/structural_role/model_dims)
     result = []
     for entry in kernels:
         annotated = copy.copy(entry)
@@ -419,10 +492,19 @@ def classify_kernel_entries(
             weight_shape = _get_weight_shape(entry)
             if weight_shape is not None and weight_shape in group_type:
                 annotated["expert_type"] = group_type[weight_shape]
+                annotated["structural_role"] = group_structural_role.get(weight_shape, "other")
             else:
                 annotated["expert_type"] = "other"
+                annotated["structural_role"] = "other"
         else:
             annotated["expert_type"] = "other"
+            annotated["structural_role"] = "other"
+        annotated["model_dims"] = {
+            "hidden_dim": hidden_dim,
+            "shared_dim": shared_dim,
+            "routed_dim": routed_dim,
+            "num_experts": num_experts,
+        }
         result.append(annotated)
 
     return result

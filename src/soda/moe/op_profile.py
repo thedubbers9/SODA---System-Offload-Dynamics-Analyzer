@@ -174,13 +174,12 @@ def _compute_hbm_fields(
     }
 
 
-def _infer_op_name(
+def _infer_structural_op_name(
     aten_op_name: str,
-    expert_type: str,
+    structural_role: str,
     input_dims: List,
-    position: int,
 ) -> str:
-    """Map (aten_op, expert_type, input_dims, position) to a human-readable op_name."""
+    """Map (aten_op, structural_role, input_dims) to a human-readable op_name."""
     # Non-GEMM special cases.
     if aten_op_name in ("aten::rms_norm",):
         return "rmsnorm"
@@ -201,26 +200,19 @@ def _infer_op_name(
             return "attn_bmm_kv"
         return "bmm"
 
-    # GEMM ops: classify by expert_type and expansion direction.
+    # GEMM ops: classify by structural role.
     if aten_op_name in _GEMM_OPS:
-        # Match the same input ordering rules used by detect.py/_compute_hbm_fields():
-        # - aten::addmm(bias, input, weight, ...) → weight is input_dims[2]
-        # - everything else → weight is input_dims[1]
-        if aten_op_name == "aten::addmm":
-            weight_shape = _normalize_shape(input_dims[2]) if len(input_dims) > 2 else []
-        else:
-            weight_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
-        expanding = _is_expanding(aten_op_name, weight_shape)
-
-        if expert_type == "shared_expert":
-            if expanding:
-                return "shared_expert_gate_proj" if position == 0 else "shared_expert_up_proj"
-            return "shared_expert_down_proj"
-        if expert_type == "routed_expert":
-            return "routed_expert_proj" if expanding else "routed_expert_down_proj"
-        if expert_type == "gate":
+        if structural_role == "shared_expert_expand":
+            return "shared_expert_expand"
+        if structural_role == "shared_expert_down":
+            return "shared_expert_down"
+        if structural_role == "routed_expert_expand":
+            return "routed_expert_expand"
+        if structural_role == "routed_expert_down":
+            return "routed_expert_down"
+        if structural_role == "moe_gate":
             return "moe_gate_proj"
-        if expert_type == "attention":
+        if structural_role == "attention":
             return "attn_proj"
         return "linear"
 
@@ -293,20 +285,6 @@ def _product(shape) -> int:
     return result
 
 
-def _is_expanding(aten_op_name: str, weight_shape: List) -> bool:
-    """Return True if this GEMM op expands the feature dimension (N > K).
-
-    aten::linear stores weight as (N, K) → expanding iff weight_shape[0] > weight_shape[1].
-    aten::mm / aten::addmm store the second matrix as (K, N) → expanding iff weight_shape[1] > weight_shape[0].
-    """
-    if not weight_shape or len(weight_shape) < 2:
-        return False
-    if aten_op_name == "aten::linear":
-        return int(weight_shape[0]) > int(weight_shape[1])
-    # mm, addmm, matmul, _scaled_mm: second matrix is (K, N).
-    return int(weight_shape[-1]) > int(weight_shape[-2])
-
-
 def _ops_per_layer(freq: int, num_layers: int) -> int:
     """Return ops per layer; 0 if freq is not evenly divisible by num_layers."""
     if num_layers <= 0 or freq <= 0:
@@ -324,6 +302,11 @@ def _make_record(
     latency_us: float,
     is_shared: bool,
     expert_type: str,
+    structural_role: str,
+    observed: bool,
+    reconstruction_source: str,
+    source_entry_id: Optional[str] = None,
+    template_alias: Optional[str] = None,
 ) -> Dict:
     """Build a single op_profile record dict."""
     shared_expert_bytes = hbm_fields["hbm_bytes"] if is_shared else 0.0
@@ -340,7 +323,184 @@ def _make_record(
         "latency_us": latency_us,
         "is_shared_expert": is_shared,
         "expert_type": expert_type,
+        "structural_role": structural_role,
+        "observed": observed,
+        "reconstruction_source": reconstruction_source,
+        "source_entry_id": source_entry_id,
+        "template_alias": template_alias,
     }
+
+
+def _record_signature(r: Dict) -> Tuple:
+    """Signature used to dedupe equivalent structural records."""
+    return (
+        r.get("structural_role"),
+        int(r.get("flops", 0)),
+        float(r.get("weight_bytes", 0.0)),
+        float(r.get("activation_bytes", 0.0)),
+        int(r.get("cta_count", 0)),
+        round(float(r.get("latency_us", 0.0)), 6),
+    )
+
+
+def _select_representatives(records: List[Dict], target_count: int) -> List[Dict]:
+    """Pick stable representatives from possibly duplicated observed records."""
+    if not records or target_count <= 0:
+        return []
+    buckets: Dict[Tuple, List[Dict]] = {}
+    for r in records:
+        sig = _record_signature(r)
+        buckets.setdefault(sig, []).append(r)
+    ranked = sorted(
+        buckets.values(),
+        key=lambda rs: (-len(rs), float(rs[0].get("latency_us", 0.0))),
+    )
+    reps = [rs[0] for rs in ranked[:target_count]]
+    while reps and len(reps) < target_count:
+        reps.append(dict(reps[-1]))
+    return reps
+
+
+def _clone_record_with_alias(
+    base: Dict,
+    op_name: str,
+    template_alias: str,
+    observed: bool,
+    reconstruction_source: str,
+    structural_role: Optional[str] = None,
+) -> Dict:
+    out = dict(base)
+    out["op_name"] = op_name
+    out["template_alias"] = template_alias
+    out["observed"] = observed
+    out["reconstruction_source"] = reconstruction_source
+    if structural_role is not None:
+        out["structural_role"] = structural_role
+    return out
+
+
+def _global_canonical_by_role(records: List[Dict], role: str) -> Optional[Dict]:
+    candidates = [
+        r for r in records
+        if r.get("layer_id", -1) >= 0 and r.get("structural_role") == role and r.get("observed")
+    ]
+    reps = _select_representatives(candidates, 1)
+    return reps[0] if reps else None
+
+
+def _reconstruct_shared_expert_template(
+    records: List[Dict],
+    num_layers: int,
+) -> List[Dict]:
+    """Reconstruct per-layer shared expert template into semantic aliases."""
+    EXPECTED_SHARED_TEMPLATE = {
+        "shared_expert_expand": 2,
+        "shared_expert_down": 1,
+    }
+    shared_roles = set(EXPECTED_SHARED_TEMPLATE.keys())
+
+    passthrough = [r for r in records if r.get("structural_role") not in shared_roles]
+    shared = [r for r in records if r.get("structural_role") in shared_roles and r.get("layer_id", -1) >= 0]
+
+    per_layer: Dict[int, Dict[str, List[Dict]]] = {
+        layer_id: {"shared_expert_expand": [], "shared_expert_down": []}
+        for layer_id in range(num_layers)
+    }
+    for r in shared:
+        layer_id = int(r.get("layer_id", -1))
+        if layer_id in per_layer:
+            per_layer[layer_id][r.get("structural_role", "other")].append(r)
+
+    global_expand = _global_canonical_by_role(shared, "shared_expert_expand")
+    global_down = _global_canonical_by_role(shared, "shared_expert_down")
+
+    reconstructed: List[Dict] = []
+    for layer_id in range(num_layers):
+        expands_obs = _select_representatives(per_layer[layer_id]["shared_expert_expand"], 2)
+        downs_obs = _select_representatives(per_layer[layer_id]["shared_expert_down"], 1)
+
+        synth_expands = 0
+        synth_downs = 0
+
+        if len(expands_obs) >= 2:
+            expands = expands_obs[:2]
+        elif len(expands_obs) == 1:
+            expands = [expands_obs[0], dict(expands_obs[0])]
+            synth_expands += 1
+        else:
+            expands = []
+            if global_expand is not None:
+                expands = [dict(global_expand), dict(global_expand)]
+                synth_expands += 2
+            elif downs_obs:
+                expands = [dict(downs_obs[0]), dict(downs_obs[0])]
+                synth_expands += 2
+
+        if downs_obs:
+            down = downs_obs[0]
+        elif global_down is not None:
+            down = dict(global_down)
+            synth_downs += 1
+        elif expands:
+            down = dict(expands[0])
+            synth_downs += 1
+        else:
+            down = None
+
+        print(
+            f"[moe.reconstruct] layer={layer_id} observed_expands={len(expands_obs)} "
+            f"observed_downs={len(downs_obs)} synthesized_expands={synth_expands} "
+            f"synthesized_downs={synth_downs}"
+        )
+
+        if len(expands) < 2 or down is None:
+            continue
+
+        gate_obs = bool(expands_obs)
+        up_obs = len(expands_obs) >= 2
+        down_obs = bool(downs_obs)
+
+        gate_source = "trace" if gate_obs else "template_from_matching_role"
+        up_source = "trace" if up_obs else "template_from_matching_role"
+        down_source = "trace" if down_obs else "template_from_matching_role"
+
+        gate_struct = dict(expands[0])
+        gate_struct["layer_id"] = layer_id
+        gate_struct["structural_role"] = "shared_expert_expand"
+        reconstructed.append(_clone_record_with_alias(
+            base=gate_struct,
+            op_name="shared_expert_gate_proj",
+            template_alias="gate_proj",
+            observed=gate_obs,
+            reconstruction_source=gate_source,
+            structural_role="shared_expert_expand",
+        ))
+
+        up_struct = dict(expands[1])
+        up_struct["layer_id"] = layer_id
+        up_struct["structural_role"] = "shared_expert_expand"
+        reconstructed.append(_clone_record_with_alias(
+            base=up_struct,
+            op_name="shared_expert_up_proj",
+            template_alias="up_proj",
+            observed=up_obs,
+            reconstruction_source=up_source,
+            structural_role="shared_expert_expand",
+        ))
+
+        down_struct = dict(down)
+        down_struct["layer_id"] = layer_id
+        down_struct["structural_role"] = "shared_expert_down"
+        reconstructed.append(_clone_record_with_alias(
+            base=down_struct,
+            op_name="shared_expert_down_proj",
+            template_alias="down_proj",
+            observed=down_obs,
+            reconstruction_source=down_source,
+            structural_role="shared_expert_down",
+        ))
+
+    return passthrough + reconstructed
 
 
 # ---------------------------------------------------------------------------
@@ -387,13 +547,11 @@ def generate_op_profile(
     ncu_results = ncu_results or {}
     num_layers = max(1, int(num_layers))
 
-    # Track position per (weight_shape_tuple, expert_type) to distinguish
-    # gate_proj (pos=0) from up_proj (pos=1) for same-shape shared expert GEMMs.
-    shape_position: Dict[Tuple, int] = {}
-    records = []
+    raw_records = []
 
     for entry in classified_kernels:
         expert_type = entry.get("expert_type", "other")
+        structural_role = entry.get("structural_role", "other")
         aten_op = entry.get("aten_op", {})
         aten_op_name = aten_op.get("name", "")
         input_dims = aten_op.get("input_dims", [])
@@ -429,23 +587,11 @@ def generate_op_profile(
         ops_count = _ops_per_layer(freq, num_layers) if expert_type != "routed_expert" else 0
         is_layer_local = ops_count > 0
 
-        # Position tracking: distinguishes gate_proj (pos=0) from up_proj (pos=1).
-        # For aten::addmm, weight is input_dims[2] (not input_dims[1]).
-        if aten_op_name == "aten::addmm" and len(input_dims) > 2 and input_dims[2]:
-            w_shape = tuple(_normalize_shape(input_dims[2]))
-        elif len(input_dims) > 1 and input_dims[1]:
-            w_shape = tuple(_normalize_shape(input_dims[1]))
-        else:
-            w_shape = ()
-        shape_key = (w_shape, expert_type)
-        pos = shape_position.get(shape_key, 0)
-        shape_position[shape_key] = pos + (ops_count if is_layer_local else 1)
-
         if is_layer_local:
             for layer_id in range(num_layers):
-                for sub_pos in range(ops_count):
-                    op_name_n = _infer_op_name(aten_op_name, expert_type, input_dims, pos + sub_pos)
-                    records.append(_make_record(
+                for _ in range(ops_count):
+                    op_name_n = _infer_structural_op_name(aten_op_name, structural_role, input_dims)
+                    raw_records.append(_make_record(
                         layer_id=layer_id,
                         op_name=op_name_n,
                         hbm_fields=hbm_fields,
@@ -453,10 +599,14 @@ def generate_op_profile(
                         latency_us=latency_us,
                         is_shared=is_shared,
                         expert_type=expert_type,
+                        structural_role=structural_role,
+                        observed=True,
+                        reconstruction_source="trace",
+                        source_entry_id=entry_id,
                     ))
         else:
-            op_name = _infer_op_name(aten_op_name, expert_type, input_dims, pos)
-            records.append(_make_record(
+            op_name = _infer_structural_op_name(aten_op_name, structural_role, input_dims)
+            raw_records.append(_make_record(
                 layer_id=-1,
                 op_name=op_name,
                 hbm_fields=hbm_fields,
@@ -464,7 +614,13 @@ def generate_op_profile(
                 latency_us=latency_us,
                 is_shared=is_shared,
                 expert_type=expert_type,
+                structural_role=structural_role,
+                observed=True,
+                reconstruction_source="trace",
+                source_entry_id=entry_id,
             ))
+
+    records = _reconstruct_shared_expert_template(raw_records, num_layers)
 
     # Sort: layer_id ASC with -1 at the end, then op_name for stability.
     records.sort(key=lambda r: (
