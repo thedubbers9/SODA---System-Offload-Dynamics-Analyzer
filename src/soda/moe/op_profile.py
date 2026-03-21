@@ -12,7 +12,9 @@ import json
 import math
 from numbers import Real
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+from soda.moe.detect import append_moe_op_profile_debug, moe_op_profile_debug_path
 
 # ATen ops that represent GEMM-type operations (matches detect.py GEMM_OPS).
 _GEMM_OPS = frozenset({
@@ -391,6 +393,7 @@ def _global_canonical_by_role(records: List[Dict], role: str) -> Optional[Dict]:
 def _reconstruct_shared_expert_template(
     records: List[Dict],
     num_layers: int,
+    moe_debug_log_path: Optional[Union[str, Path]] = None,
 ) -> List[Dict]:
     """Reconstruct per-layer shared expert template into semantic aliases."""
     EXPECTED_SHARED_TEMPLATE = {
@@ -447,10 +450,11 @@ def _reconstruct_shared_expert_template(
         else:
             down = None
 
-        print(
+        append_moe_op_profile_debug(
+            moe_debug_log_path,
             f"[moe.reconstruct] layer={layer_id} observed_expands={len(expands_obs)} "
             f"observed_downs={len(downs_obs)} synthesized_expands={synth_expands} "
-            f"synthesized_downs={synth_downs}"
+            f"synthesized_downs={synth_downs}",
         )
 
         if len(expands) < 2 or down is None:
@@ -513,6 +517,7 @@ def generate_op_profile(
     precision: str = "bfloat16",
     ncu_results: Optional[Dict[str, Dict]] = None,
     output_path: Optional[Path] = None,
+    moe_debug_log_path: Optional[Union[str, Path]] = None,
 ) -> List[Dict]:
     """Generate per-layer per-op records for all kernels.
 
@@ -532,11 +537,17 @@ def generate_op_profile(
         ncu_results: Optional kernel_id -> NCU result dict; overrides
             shape-estimated hbm_bytes with actual dram_read + dram_write.
         output_path: If provided, writes op_profile.json to this path.
+        moe_debug_log_path: If set, append reconstruction debug lines here.
+            If None and output_path is set, defaults to ``op_profile.debug.txt``
+            in the same directory as ``op_profile.json``.
 
     Returns:
         List of record dicts, sorted by layer_id ASC (layer_id=-1 at end),
         then by op_name.
     """
+    if output_path is not None and moe_debug_log_path is None:
+        moe_debug_log_path = moe_op_profile_debug_path(output_path)
+
     if not classified_kernels:
         records: List[Dict] = []
         if output_path is not None:
@@ -620,7 +631,13 @@ def generate_op_profile(
                 source_entry_id=entry_id,
             ))
 
-    records = _reconstruct_shared_expert_template(raw_records, num_layers)
+    append_moe_op_profile_debug(
+        moe_debug_log_path,
+        "[moe.reconstruct] --- shared expert template reconstruction ---",
+    )
+    records = _reconstruct_shared_expert_template(
+        raw_records, num_layers, moe_debug_log_path=moe_debug_log_path
+    )
 
     # Sort: layer_id ASC with -1 at the end, then op_name for stability.
     records.sort(key=lambda r: (

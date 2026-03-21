@@ -29,6 +29,7 @@ from typing import Dict, List, Optional
 from soda.moe.detect import (
     classify_kernel_entries,
     get_entries_by_type,
+    moe_op_profile_debug_path,
     sample_routed_entries,
 )
 from soda.moe.op_profile import _detect_num_layers, generate_op_profile
@@ -72,6 +73,13 @@ class MoEProfilePipeline:
         print(f"\n[MoE Profile] Kernel DB: {self.kernel_db_path}")
         print(f"[MoE Profile] Output:     {self.output_dir}")
 
+        op_profile_path = self.output_dir / "op_profile.json"
+        moe_debug_path = moe_op_profile_debug_path(op_profile_path)
+        moe_debug_path.write_text(
+            "# MoE debug log: kernel classification (detect) + op_profile reconstruction\n",
+            encoding="utf-8",
+        )
+
         # 1. Classify entries
         hf_config = self.kernel_db.get("metadata", {}).get("model_config")
         classified = classify_kernel_entries(
@@ -79,6 +87,7 @@ class MoEProfilePipeline:
             model_config=hf_config,
             shared_dim_override=self.shared_dim_override,
             routed_dim_override=self.routed_dim_override,
+            moe_debug_log_path=moe_debug_path,
         )
         self._print_classification_summary(classified)
 
@@ -127,18 +136,19 @@ class MoEProfilePipeline:
         meta = self.kernel_db.get("metadata", {})
         cfg = meta.get("config", meta)
         precision = cfg.get("precision", "bfloat16") or "bfloat16"
-        op_profile_path = self.output_dir / "op_profile.json"
         records = generate_op_profile(
             classified_kernels=classified,
             num_layers=num_layers,
             precision=precision,
             ncu_results=ncu_results,
             output_path=op_profile_path,
+            moe_debug_log_path=moe_debug_path,
         )
         print(
             f"[MoE Profile] Op profile ({len(records)} records, "
             f"{num_layers} layers): {op_profile_path}"
         )
+        print(f"[MoE Profile] MoE debug log: {moe_debug_path}")
 
         return report_path
 
