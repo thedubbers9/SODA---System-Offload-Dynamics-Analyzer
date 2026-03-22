@@ -13,10 +13,12 @@ Two-pass design — passes are always separate invocations:
     Instruments kernels tagged by expert_type in execution order.
     Provides in-context L1/L2 cache-line reuse and cross-expert data reuse.
 
-**Dataflow artifacts** (written under ``moe_profile/`` by ``generate_op_profile``):
-``op_pipeline.json`` (ordered nodes), ``dataflow_profile.json`` (logical buffers
-R/M/P/E/D and workspace bounds for simulators), and ``dataflow.debug.txt``.  See
-``soda.moe.dataflow`` module comments for architectural assumptions.
+**Dataflow artifacts** — (1) Legacy path under ``generate_op_profile``:
+``op_pipeline.json``, ``dataflow_profile.json``, ``dataflow.debug.txt`` (see
+``soda.moe.dataflow``).  (2) **Experimental** simulator path (``soda.moe.experimental``,
+on by default): ``moe_dataflow_graph.json`` (canonical handoff), ``moe_pipeline_nodes.json``,
+``moe_pipeline_groups.json``, ``moe_dataflow.debug.txt``.  Disable with
+``--skip-moe-experimental-dataflow``.
 
 Usage::
 
@@ -135,6 +137,29 @@ class MoEProfilePipeline:
             args=self.args,
         )
         print(f"\n[MoE Profile] Report: {report_path}")
+
+        # 4b. Experimental MoE dataflow graph (simulator handoff; no op_profile dependency)
+        if not getattr(self.args, "skip_moe_experimental_dataflow", False):
+            from soda.moe.experimental.experimental_pipeline import run_experimental_moe_dataflow
+
+            num_layers = self._get_num_layers(classified)
+            meta = self.kernel_db.get("metadata", {})
+            cfg = meta.get("config", meta)
+            precision = cfg.get("precision", "bfloat16") or "bfloat16"
+            exp_paths = run_experimental_moe_dataflow(
+                classified_kernels=classified,
+                output_dir=self.output_dir,
+                kernel_db_path=self.kernel_db_path,
+                trace_path=None,
+                num_layers=num_layers,
+                precision=precision,
+                ncu_results=ncu_results,
+                moe_debug_log_path=moe_debug_path,
+            )
+            print(
+                f"[MoE Profile] Experimental dataflow (simulator): "
+                f"{exp_paths.get('moe_dataflow_graph')}"
+            )
 
         # 5. Generate op_profile.json
         num_layers = self._get_num_layers(classified)

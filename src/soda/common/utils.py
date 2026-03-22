@@ -909,6 +909,14 @@ def get_args_parser() -> argparse.ArgumentParser:
              "op_profile.json. Defaults to GCD-based detection from shared "
              "expert entry frequencies.",
     )
+    parser.add_argument(
+        "--skip-moe-experimental-dataflow",
+        dest="skip_moe_experimental_dataflow",
+        action="store_true",
+        default=False,
+        help="With --moe-profile, do not emit moe_dataflow_graph.json and related "
+             "experimental MoE dataflow artifacts (see soda.moe.experimental).",
+    )
 
     return parser
 
