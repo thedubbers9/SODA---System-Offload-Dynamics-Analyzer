@@ -13,6 +13,11 @@ Two-pass design — passes are always separate invocations:
     Instruments kernels tagged by expert_type in execution order.
     Provides in-context L1/L2 cache-line reuse and cross-expert data reuse.
 
+**Dataflow artifacts** (written under ``moe_profile/`` by ``generate_op_profile``):
+``op_pipeline.json`` (ordered nodes), ``dataflow_profile.json`` (logical buffers
+R/M/P/E/D and workspace bounds for simulators), and ``dataflow.debug.txt``.  See
+``soda.moe.dataflow`` module comments for architectural assumptions.
+
 Usage::
 
     soda-cli --moe-profile --kernel-db-path <path>
@@ -143,11 +148,18 @@ class MoEProfilePipeline:
             ncu_results=ncu_results,
             output_path=op_profile_path,
             moe_debug_log_path=moe_debug_path,
+            kernel_db_path=self.kernel_db_path,
         )
         print(
             f"[MoE Profile] Op profile ({len(records)} records, "
             f"{num_layers} layers): {op_profile_path}"
         )
+        df_p = self.output_dir / "dataflow_profile.json"
+        if df_p.is_file():
+            print(
+                f"[MoE Profile] Dataflow (simulator handoff): {df_p} "
+                f"(see also op_pipeline.json, dataflow.debug.txt)"
+            )
         print(f"[MoE Profile] MoE debug log: {moe_debug_path}")
 
         return report_path

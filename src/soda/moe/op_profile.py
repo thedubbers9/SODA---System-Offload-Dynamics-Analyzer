@@ -1,10 +1,29 @@
 """Per-layer per-op kernel profile generator.
 
-Generates op_profile.json: one record per unique kernel invocation type per layer
-across the full model, with is_shared_expert flag for downstream filtering.
+Generates ``op_profile.json``: one record per unique kernel invocation type per layer
+across the full model, with ``is_shared_expert`` flag for downstream filtering.
+Records remain **sorted by** ``(layer_id, op_name)`` for stable, diff-friendly
+aggregates — this ordering is **intentionally insufficient** for scratchpad /
+controlled-L2 residency modeling because it discards execution adjacency.
 
-Data source: classified kernel DB entries (from classify_kernel_entries()).
-No GPU required — derived from kernel_database.json + MoE classification.
+**Dataflow artifacts** (see ``soda.moe.dataflow``) written alongside when
+``output_path`` is set:
+
+  * ``op_pipeline.json`` — ordered ``PipelineNode`` list (per-layer execution order,
+    ``dataflow_role`` labels).  Use this for schedule-aware views.
+  * ``dataflow_profile.json`` — simulator handoff: logical buffers R/M/P/E/D,
+    producer/consumer edges, group workspace estimates (staged vs conservative).
+  * ``dataflow.debug.txt`` — human audit of grouping and buffer reconstruction.
+
+Optional fields appended to each ``op_profile.json`` row when dataflow runs:
+``execution_index``, ``dataflow_role``, ``pipeline_group_id``,
+``logical_buffer_produced``, ``logical_buffers_consumed``,
+``producer_consumer_notes`` — all **advisory** (may be null).
+
+Data source: classified kernel DB entries (from ``classify_kernel_entries()``).
+No GPU required — derived from ``kernel_database.json`` + MoE classification.
+Execution order prefers ``trace.json`` (first GPU kernel timestamp per template)
+when available; otherwise a loud warning is embedded in exported metadata.
 """
 from __future__ import annotations
 
@@ -518,6 +537,9 @@ def generate_op_profile(
     ncu_results: Optional[Dict[str, Dict]] = None,
     output_path: Optional[Path] = None,
     moe_debug_log_path: Optional[Union[str, Path]] = None,
+    trace_path: Optional[Union[str, Path]] = None,
+    kernel_db_path: Optional[Union[str, Path]] = None,
+    emit_dataflow_artifacts: bool = True,
 ) -> List[Dict]:
     """Generate per-layer per-op records for all kernels.
 
@@ -540,6 +562,13 @@ def generate_op_profile(
         moe_debug_log_path: If set, append reconstruction debug lines here.
             If None and output_path is set, defaults to ``op_profile.debug.txt``
             in the same directory as ``op_profile.json``.
+        trace_path: Optional Chrome ``trace.json`` for better execution ordering
+            of pipeline nodes (first GPU kernel timestamp per cleaned name).
+        kernel_db_path: Used only to locate ``trace.json`` when ``trace_path`` is
+            omitted (sibling of ``kernel_database.json``).
+        emit_dataflow_artifacts: When True and ``output_path`` is set, also writes
+            ``op_pipeline.json``, ``dataflow_profile.json``, ``dataflow.debug.txt``,
+            and enriches ``op_profile.json`` rows with optional dataflow fields.
 
     Returns:
         List of record dicts, sorted by layer_id ASC (layer_id=-1 at end),
@@ -644,6 +673,30 @@ def generate_op_profile(
         r["layer_id"] if r["layer_id"] >= 0 else 10 ** 9,
         r["op_name"],
     ))
+
+    if output_path is not None and emit_dataflow_artifacts:
+        from soda.moe import dataflow
+
+        tp: Optional[Path] = None
+        if trace_path is not None:
+            tp = Path(trace_path)
+            if not tp.is_file():
+                tp = None
+        if tp is None and kernel_db_path is not None:
+            tp = dataflow.resolve_trace_path(Path(kernel_db_path))
+        if tp is None:
+            tp = dataflow.resolve_trace_path_for_op_profile(Path(output_path))
+
+        df_out = dataflow.emit_dataflow_artifacts(
+            classified_kernels=classified_kernels,
+            num_layers=num_layers,
+            precision=precision,
+            ncu_results=ncu_results,
+            trace_path=tp,
+            output_dir=Path(output_path).parent,
+            moe_debug_log_path=moe_debug_log_path,
+        )
+        dataflow.enrich_op_profile_records(records, df_out["nodes"])
 
     if output_path is not None:
         Path(output_path).write_text(json.dumps(records, indent=2))

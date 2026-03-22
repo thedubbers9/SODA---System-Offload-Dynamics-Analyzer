@@ -157,6 +157,16 @@ soda-cli --moe-profile \
 
 Records with `layer_id == -1` are not layer-specific (embedding, LM head, variable-shape routed experts). `num_layers` auto-detection priority: `--moe-num-layers` → HF `AutoConfig` → GCD of shared expert frequencies.
 
+**MoE dataflow (scratchpad / controlled-L2 modeling).** `op_profile.json` stays a flat, `op_name`-sorted aggregate for backward compatibility. For execution order, logical buffers, and producer–consumer edges, use the additional artifacts next to it:
+
+| File | Role |
+|------|------|
+| `op_pipeline.json` | Ordered per-layer pipeline nodes with `dataflow_role` (routing, pack, expert MLP, unpack). |
+| `dataflow_profile.json` | Simulator handoff: `PipelineGroup` segments, reconstructed buffers **R/M/P/E/D**, adjacency, staged vs conservative peak workspace estimates, confidence labels. |
+| `dataflow.debug.txt` | Human-readable audit of grouping, roles, and buffer sizes. |
+
+Ordering prefers sibling `trace.json` (first GPU kernel timestamp per template) when present; otherwise metadata warns that the kernel DB list order is only a weak proxy for program order.
+
 ## Running on SLURM
 
 ```bash
