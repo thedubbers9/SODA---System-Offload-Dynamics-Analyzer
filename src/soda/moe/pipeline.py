@@ -15,10 +15,13 @@ Two-pass design — passes are always separate invocations:
 
 **Dataflow artifacts** — (1) Legacy path under ``generate_op_profile``:
 ``op_pipeline.json``, ``dataflow_profile.json``, ``dataflow.debug.txt`` (see
-``soda.moe.dataflow``).  (2) **Experimental** simulator path (``soda.moe.experimental``,
-on by default): ``moe_dataflow_graph.json`` (canonical handoff), ``moe_pipeline_nodes.json``,
-``moe_pipeline_groups.json``, ``moe_dataflow.debug.txt``.  Disable with
-``--skip-moe-experimental-dataflow``.
+``soda.moe.dataflow``).  (2) **Minimal MoE chain** path (``soda.moe.moe_dataflow``,
+on by default): ``moe_minimal_chains.json``, ``moe_minimal_buffers.json``,
+``moe_dataflow.debug.txt``.  Disable with ``--skip-moe-minimal-dataflow``.
+
+Standalone CLI::
+
+    python -m soda.moe.moe_dataflow.main --kernel-db <path> --out-dir <dir> [--trace <path>]
 
 Usage::
 
@@ -138,27 +141,25 @@ class MoEProfilePipeline:
         )
         print(f"\n[MoE Profile] Report: {report_path}")
 
-        # 4b. Experimental MoE dataflow graph (simulator handoff; no op_profile dependency)
-        if not getattr(self.args, "skip_moe_experimental_dataflow", False):
-            from soda.moe.experimental.experimental_pipeline import run_experimental_moe_dataflow
+        # 4b. Minimal MoE routed-expert chain + buffers (no op_profile dependency)
+        if not getattr(self.args, "skip_moe_minimal_dataflow", False):
+            from soda.moe.moe_dataflow.main import run_minimal_moe_dataflow
 
             num_layers = self._get_num_layers(classified)
             meta = self.kernel_db.get("metadata", {})
             cfg = meta.get("config", meta)
             precision = cfg.get("precision", "bfloat16") or "bfloat16"
-            exp_paths = run_experimental_moe_dataflow(
+            m_paths = run_minimal_moe_dataflow(
                 classified_kernels=classified,
                 output_dir=self.output_dir,
                 kernel_db_path=self.kernel_db_path,
                 trace_path=None,
                 num_layers=num_layers,
                 precision=precision,
-                ncu_results=ncu_results,
                 moe_debug_log_path=moe_debug_path,
             )
             print(
-                f"[MoE Profile] Experimental dataflow (simulator): "
-                f"{exp_paths.get('moe_dataflow_graph')}"
+                f"[MoE Profile] Minimal MoE dataflow: {m_paths.get('moe_minimal_chains')}"
             )
 
         # 5. Generate op_profile.json

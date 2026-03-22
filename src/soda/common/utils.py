@@ -910,12 +910,13 @@ def get_args_parser() -> argparse.ArgumentParser:
              "expert entry frequencies.",
     )
     parser.add_argument(
-        "--skip-moe-experimental-dataflow",
-        dest="skip_moe_experimental_dataflow",
+        "--skip-moe-minimal-dataflow",
+        dest="skip_moe_minimal_dataflow",
         action="store_true",
         default=False,
-        help="With --moe-profile, do not emit moe_dataflow_graph.json and related "
-             "experimental MoE dataflow artifacts (see soda.moe.experimental).",
+        help="With --moe-profile, do not emit moe_minimal_chains.json, "
+             "moe_minimal_buffers.json, or moe_dataflow.debug.txt from "
+             "soda.moe.moe_dataflow.",
     )
 
     return parser
