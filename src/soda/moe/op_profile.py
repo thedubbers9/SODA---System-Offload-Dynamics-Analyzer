@@ -6,19 +6,12 @@ Records remain **sorted by** ``(layer_id, op_name)`` for stable, diff-friendly
 aggregates — this ordering is **intentionally insufficient** for scratchpad /
 controlled-L2 residency modeling because it discards execution adjacency.
 
-**Dataflow artifacts** (see ``soda.moe.dataflow``) written alongside when
-``output_path`` is set:
-
-  * ``op_pipeline.json`` — ordered ``PipelineNode`` list (per-layer execution order,
-    ``dataflow_role`` labels).  Use this for schedule-aware views.
-  * ``dataflow_profile.json`` — simulator handoff: logical buffers R/M/P/E/D,
-    producer/consumer edges, group workspace estimates (staged vs conservative).
-  * ``dataflow.debug.txt`` — human audit of grouping and buffer reconstruction.
-
-Optional fields appended to each ``op_profile.json`` row when dataflow runs:
-``execution_index``, ``dataflow_role``, ``pipeline_group_id``,
-``logical_buffer_produced``, ``logical_buffers_consumed``,
-``producer_consumer_notes`` — all **advisory** (may be null).
+**Legacy dataflow** (see ``soda.moe.dataflow``) is **off** by default. When
+``emit_dataflow_artifacts=True``, it also writes ``op_pipeline.json``,
+``dataflow_profile.json``, ``dataflow.debug.txt``, and appends optional fields to
+``op_profile.json`` (``execution_index``, ``dataflow_role``, ``pipeline_group_id``,
+etc.). Prefer ``soda.moe.moe_dataflow`` for minimal routed-expert chains
+(``moe_minimal_chains.json``).
 
 Data source: classified kernel DB entries (from ``classify_kernel_entries()``).
 No GPU required — derived from ``kernel_database.json`` + MoE classification.
@@ -539,7 +532,7 @@ def generate_op_profile(
     moe_debug_log_path: Optional[Union[str, Path]] = None,
     trace_path: Optional[Union[str, Path]] = None,
     kernel_db_path: Optional[Union[str, Path]] = None,
-    emit_dataflow_artifacts: bool = True,
+    emit_dataflow_artifacts: bool = False,
 ) -> List[Dict]:
     """Generate per-layer per-op records for all kernels.
 
@@ -566,9 +559,11 @@ def generate_op_profile(
             of pipeline nodes (first GPU kernel timestamp per cleaned name).
         kernel_db_path: Used only to locate ``trace.json`` when ``trace_path`` is
             omitted (sibling of ``kernel_database.json``).
-        emit_dataflow_artifacts: When True and ``output_path`` is set, also writes
-            ``op_pipeline.json``, ``dataflow_profile.json``, ``dataflow.debug.txt``,
-            and enriches ``op_profile.json`` rows with optional dataflow fields.
+        emit_dataflow_artifacts: When True and ``output_path`` is set, also runs the
+            legacy broad ``soda.moe.dataflow`` pass: ``op_pipeline.json``,
+            ``dataflow_profile.json``, ``dataflow.debug.txt``, and enriches
+            ``op_profile.json`` with optional dataflow fields. Default False; prefer
+            ``soda.moe.moe_dataflow`` for routed-expert chains.
 
     Returns:
         List of record dicts, sorted by layer_id ASC (layer_id=-1 at end),

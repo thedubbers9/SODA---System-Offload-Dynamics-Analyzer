@@ -52,31 +52,47 @@ def validate_gate_anchor(
     layer_ops: List[StreamNode],
     anchor_ei: int,
 ) -> Tuple[bool, str]:
-    """Return ``(accepted, reason)`` for a candidate gate at ``anchor_ei``."""
-    if anchor_ei < 0 or anchor_ei >= len(layer_ops):
-        return False, "invalid execution index"
-    gate = layer_ops[anchor_ei]
-    if not is_gate_candidate(gate):
-        return False, "not moe_gate_proj"
+    """Return ``(accepted, reason)`` for a candidate gate at ``anchor_ei``.
 
-    end = min(len(layer_ops), anchor_ei + ANCHOR_VALIDATION_FORWARD_OPS)
-    window = layer_ops[anchor_ei:end]
+    Reasons are stable tokens for logs and regression checks (not prose).
+    """
+    return is_valid_routed_gate_anchor(layer_ops, anchor_ei)
+
+
+def is_valid_routed_gate_anchor(
+    layer_ops: List[StreamNode],
+    gate_idx: int,
+) -> Tuple[bool, str]:
+    """True only if a small forward window contains routing select + ``_grouped_mm``.
+
+    Scans at most :data:`ANCHOR_VALIDATION_FORWARD_OPS` ops starting at the gate
+    (inclusive). Does **not** trust op names beyond gate candidacy and the
+    explicit aten checks below.
+    """
+    if gate_idx < 0 or gate_idx >= len(layer_ops):
+        return False, "invalid_execution_index"
+    gate = layer_ops[gate_idx]
+    if not is_gate_candidate(gate):
+        return False, "not_moe_gate_proj"
+
+    end = min(len(layer_ops), gate_idx + ANCHOR_VALIDATION_FORWARD_OPS)
+    window = layer_ops[gate_idx:end]
 
     has_select = any(_is_select_op(n) for n in window)
     if not has_select:
-        return False, "no nearby topk/sort"
+        return False, "no_routing_select_after_gate"
 
     first_mm_idx: Optional[int] = None
     for i, n in enumerate(window):
         if _is_grouped_mm(n):
-            first_mm_idx = anchor_ei + i
+            first_mm_idx = gate_idx + i
             break
     if first_mm_idx is None:
-        return False, "no nearby _grouped_mm"
+        return False, "no_grouped_mm_after_gate"
 
-    for j in range(anchor_ei + 1, first_mm_idx):
+    for j in range(gate_idx + 1, first_mm_idx):
         if _is_attention_barrier(layer_ops[j]):
-            return False, "unrelated attention block between gate and grouped GEMM"
+            return False, "attention_ops_intervene_before_grouped_mm"
 
     return True, "ok"
 

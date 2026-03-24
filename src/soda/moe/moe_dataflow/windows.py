@@ -12,8 +12,17 @@ from typing import List
 from soda.moe.moe_dataflow.anchors import is_gate_candidate
 from soda.moe.moe_dataflow.ordering import GROUPED_MM_ATEN, StreamNode
 
-# Include up to this many ops after the last _grouped_mm in the chain window.
-TRAILING_OPS_AFTER_LAST_GEMM = 2
+# Trailing mm/linear after the last _grouped_mm (at most one op, only if it matches).
+_POST_EXPERT_ATEN = frozenset(
+    {
+        "aten::linear",
+        "aten::mm",
+        "aten::bmm",
+        "aten::addmm",
+        "aten::matmul",
+        "aten::_scaled_mm",
+    }
+)
 
 
 @dataclass
@@ -32,27 +41,46 @@ def _is_grouped_mm(n: StreamNode) -> bool:
 
 
 def build_chain_window(layer_ops: List[StreamNode], anchor_ei: int) -> ChainWindow:
-    """From a validated gate anchor, extend forward to the last grouped GEMM (+ tail).
+    """Anchor-first window: gate through last ``_grouped_mm`` in this block (+ optional tail).
 
-    The scan stops before the **next** ``moe_gate_proj`` so a later MoE block in the
-    same layer is not merged into this chain.
+    Stops before the next ``moe_gate_proj``. Does not walk backward before the gate.
+    Shared-expert ``_grouped_mm`` ops that appear **before** this anchor are never
+    included.
     """
-    layer_id = layer_ops[anchor_ei].layer_id if layer_ops else 0
+    return extract_minimal_routed_window(layer_ops, anchor_ei)
+
+
+def extract_minimal_routed_window(layer_ops: List[StreamNode], anchor_idx: int) -> ChainWindow:
+    """Forward-only window from a validated gate to the routed-expert grouped-GEMM tail."""
+    layer_id = layer_ops[anchor_idx].layer_id if layer_ops else 0
     next_gate = len(layer_ops)
-    for j in range(anchor_ei + 1, len(layer_ops)):
+    for j in range(anchor_idx + 1, len(layer_ops)):
         if is_gate_candidate(layer_ops[j]):
             next_gate = j
             break
-    last_mm = anchor_ei
-    for i in range(anchor_ei, next_gate):
+    last_mm = anchor_idx
+    for i in range(anchor_idx, next_gate):
         if _is_grouped_mm(layer_ops[i]):
             last_mm = i
-    end_ei = min(len(layer_ops) - 1, last_mm + TRAILING_OPS_AFTER_LAST_GEMM)
-    indices = list(range(anchor_ei, end_ei + 1))
+    end_ei = last_mm
+    if last_mm + 1 < next_gate and last_mm + 1 < len(layer_ops):
+        nxt = layer_ops[last_mm + 1]
+        if (nxt.aten_op_name or "") in _POST_EXPERT_ATEN:
+            end_ei = last_mm + 1
+    indices = list(range(anchor_idx, end_ei + 1))
     return ChainWindow(
         layer_id=layer_id,
-        anchor_ei=anchor_ei,
-        start_ei=anchor_ei,
+        anchor_ei=anchor_idx,
+        start_ei=anchor_idx,
         end_ei=end_ei,
         node_indices=indices,
     )
+
+
+def minimal_routed_window_stream_nodes(
+    layer_ops: List[StreamNode],
+    anchor_idx: int,
+) -> List[StreamNode]:
+    """Same window as :func:`extract_minimal_routed_window`, as concrete nodes."""
+    cw = extract_minimal_routed_window(layer_ops, anchor_idx)
+    return [layer_ops[i] for i in cw.node_indices]

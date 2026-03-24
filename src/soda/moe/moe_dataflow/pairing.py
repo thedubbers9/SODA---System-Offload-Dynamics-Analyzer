@@ -1,11 +1,8 @@
-"""Grouped GEMM discovery, consecutive pairing, and coarse window classification.
+"""Grouped GEMM pairing and coarse roles inside the minimal routed-expert window only.
 
-Logical labels ``expert_pair_expand`` / ``expert_pair_down`` are minimal model roles
-per pair (first / second grouped GEMM); they are not claimed to match exact MLP
-semantics.
-
-This is a minimal MoE-local reconstruction pass — no pack/unpack/shared-expert
-modeling.
+Per-pair slots ``pair_N_gemm0`` / ``pair_N_gemm1`` (semantic aliases: pair_expand /
+pair_down **within that pair only**). No global "first grouped GEMM in layer =
+expand" rule.
 """
 
 from __future__ import annotations
@@ -35,16 +32,17 @@ class ClassifiedOp:
     aten_op_name: str
     op_name: str
     kernel_entry_name: str
-    coarse_class: str  # routing_logits | routing_select | routing_metadata | grouped_expert_gemm | post_expert_candidate | unclassified
+    coarse_class: str  # routing_logits | routing_select | routing_metadata | grouped_expert_gemm | post_expert_candidate | unknown_within_window
     gemm_pair_index: Optional[int] = None
-    gemm_logical_role: Optional[str] = None  # expert_pair_expand | expert_pair_down
+    pair_gemm_slot: Optional[str] = None  # gemm0 | gemm1 within the pair
+    pair_role_label: Optional[str] = None  # e.g. pair_0_gemm0
 
 
 @dataclass
 class GemmPairRecord:
     pair_id: int
-    expand_ei: int
-    down_ei: int
+    gemm0_ei: int
+    gemm1_ei: int
 
 
 @dataclass
@@ -66,9 +64,10 @@ def _classify_window_ops(
     for idx in window_indices:
         n = layer_ops[idx]
         a = (n.aten_op_name or "").lower()
-        coarse = "unclassified"
+        coarse = "unknown_within_window"
         pair_idx: Optional[int] = None
-        role: Optional[str] = None
+        slot: Optional[str] = None
+        pr_label: Optional[str] = None
 
         if idx == anchor_ei:
             coarse = "routing_logits"
@@ -85,7 +84,8 @@ def _classify_window_ops(
                     pos = -1
                 if pos >= 0:
                     pair_idx = pos // 2
-                    role = "expert_pair_expand" if pos % 2 == 0 else "expert_pair_down"
+                    slot = "gemm0" if pos % 2 == 0 else "gemm1"
+                    pr_label = f"pair_{pair_idx}_gemm0" if pos % 2 == 0 else f"pair_{pair_idx}_gemm1"
         elif idx > last_mm and n.aten_op_name in _GEMM_FOR_POST:
             coarse = "post_expert_candidate"
 
@@ -97,14 +97,15 @@ def _classify_window_ops(
                 kernel_entry_name=n.kernel_entry_name,
                 coarse_class=coarse,
                 gemm_pair_index=pair_idx,
-                gemm_logical_role=role,
+                pair_gemm_slot=slot,
+                pair_role_label=pr_label,
             )
         )
     return out
 
 
 def pair_grouped_gemms(grouped_mm_eis: List[int]) -> tuple[List[GemmPairRecord], bool]:
-    """Pair ``(0,1), (2,3), ...``; drop trailing odd GEMM with warning flag."""
+    """Pair consecutive grouped GEMMs: (0,1), (2,3), …; drop trailing odd with warning."""
     pairs: List[GemmPairRecord] = []
     odd = False
     g = list(grouped_mm_eis)
@@ -112,7 +113,7 @@ def pair_grouped_gemms(grouped_mm_eis: List[int]) -> tuple[List[GemmPairRecord],
         odd = True
         g = g[:-1]
     for i in range(0, len(g), 2):
-        pairs.append(GemmPairRecord(pair_id=i // 2, expand_ei=g[i], down_ei=g[i + 1]))
+        pairs.append(GemmPairRecord(pair_id=i // 2, gemm0_ei=g[i], gemm1_ei=g[i + 1]))
     return pairs, odd
 
 
@@ -133,10 +134,17 @@ def analyze_chain_window(
 
 
 def pairing_result_to_json_dict(pr: PairingResult) -> Dict[str, Any]:
+    """Verbose pairing dump (optional / archival). Minimal JSON uses flat chain records."""
     return {
         "grouped_mm_execution_indices": list(pr.grouped_mm_eis),
-        "pairs": [
-            {"pair_id": p.pair_id, "expert_pair_expand_ei": p.expand_ei, "expert_pair_down_ei": p.down_ei}
+        "gemm_pairs": [
+            {
+                "pair_id": p.pair_id,
+                "gemm0_ei": p.gemm0_ei,
+                "gemm1_ei": p.gemm1_ei,
+                "pair_expand_ei": p.gemm0_ei,
+                "pair_down_ei": p.gemm1_ei,
+            }
             for p in pr.pairs
         ],
         "odd_unpaired_grouped_mm_dropped": pr.odd_gemm_warning,
@@ -148,7 +156,8 @@ def pairing_result_to_json_dict(pr: PairingResult) -> Dict[str, Any]:
                 "kernel_entry_name": c.kernel_entry_name,
                 "coarse_class": c.coarse_class,
                 "gemm_pair_index": c.gemm_pair_index,
-                "gemm_logical_role": c.gemm_logical_role,
+                "pair_gemm_slot": c.pair_gemm_slot,
+                "pair_role_label": c.pair_role_label,
             }
             for c in pr.classified
         ],

@@ -918,6 +918,30 @@ def get_args_parser() -> argparse.ArgumentParser:
              "moe_minimal_buffers.json, or moe_dataflow.debug.txt from "
              "soda.moe.moe_dataflow.",
     )
+    parser.add_argument(
+        "--moe-parse-layer",
+        dest="moe_parse_layer",
+        type=int,
+        default=None,
+        help="With --moe-profile, run minimal MoE dataflow on this layer only "
+             "(faster iteration; compact debug for that layer).",
+    )
+    parser.add_argument(
+        "--moe-debug-full-layer",
+        dest="moe_debug_full_layer",
+        action="store_true",
+        default=False,
+        help="With --moe-profile, add grouped-GEMM shape detail lines to moe_dataflow.debug.txt.",
+    )
+    parser.add_argument(
+        "--moe-legacy-dataflow",
+        dest="moe_legacy_dataflow",
+        action="store_true",
+        default=False,
+        help="With --moe-profile, also emit legacy soda.moe.dataflow artifacts "
+             "(dataflow_profile.json, op_pipeline.json, dataflow.debug.txt) and "
+             "enrich op_profile.json with pipeline_group_id / dataflow_role.",
+    )
 
     return parser
 

@@ -1,20 +1,17 @@
 """CLI and orchestration for minimal MoE routed-expert chain reconstruction.
 
-This is a minimal MoE-local reconstruction pass: it does not reconstruct the full
-graph, infer exact tensor identity, or integrate shared experts. It exists only
-for architectural intermediate-residency modeling (logical R/M/P/E/D buffers).
+This path does not call ``soda.moe.dataflow`` (legacy broad grouping). Usage::
 
-Usage::
-
-    python -m soda.moe.moe_dataflow.main --kernel-db ... --out-dir ... [--trace ...] [--layer N]
+    python -m soda.moe.moe_dataflow.main --kernel-db ... --out-dir ... [--trace ...] [--layer N] [--debug-full-layer]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from soda.moe.dataflow import resolve_trace_path
 from soda.moe.moe_dataflow.anchors import (
@@ -28,19 +25,16 @@ from soda.moe.moe_dataflow.buffers import (
     build_chain_buffers,
 )
 from soda.moe.moe_dataflow.debug import (
-    format_anchor_lines,
-    format_buffer_lines,
-    format_chain_lines,
+    format_section_a_candidate_gates,
+    format_section_b_routed_windows,
+    format_section_c_gemm_pairs,
+    format_section_d_buffers,
     render_debug,
 )
 from soda.moe.moe_dataflow.loader import classify_kernels_from_db, load_kernel_database
 from soda.moe.moe_dataflow.ordering import build_ordered_stream_per_layer, order_classified_entries
-from soda.moe.moe_dataflow.pairing import (
-    PairingResult,
-    analyze_chain_window,
-    pairing_result_to_json_dict,
-)
-from soda.moe.moe_dataflow.windows import build_chain_window
+from soda.moe.moe_dataflow.pairing import PairingResult, analyze_chain_window
+from soda.moe.moe_dataflow.windows import ChainWindow, build_chain_window
 from soda.moe.op_profile import _detect_num_layers
 
 
@@ -73,10 +67,7 @@ def assert_reference_layer0_layout(
     layer0_decisions: Dict[int, Tuple[bool, str]],
     accepted_chains: List[Tuple[int, int, PairingResult]],
 ) -> None:
-    """Loud checks for the known regression layout (gate at 34 bogus, 44 real MoE block).
-
-    Runs only when layer 0 exposes both execution indices 34 and 44 as moe_gate_proj candidates.
-    """
+    """Regression layout: gate 34 bogus, 44 real; four grouped GEMMs; two pairs."""
     if 34 not in layer0_candidates or 44 not in layer0_candidates:
         return
     d34 = layer0_decisions.get(34)
@@ -86,8 +77,35 @@ def assert_reference_layer0_layout(
     assert d44[0] is True, f"expected accept gate ei=44, got reject ({d44[1]})"
     pr44 = next((pr for lid, ae, pr in accepted_chains if lid == 0 and ae == 44), None)
     assert pr44 is not None, "expected accepted chain at layer 0 anchor 44"
-    assert len(pr44.grouped_mm_eis) == 4, f"expected 4 grouped GEMMs at ei 44 chain, got {pr44.grouped_mm_eis}"
+    assert pr44.grouped_mm_eis == [50, 51, 52, 53], (
+        f"expected grouped GEMMs [50,51,52,53], got {pr44.grouped_mm_eis}"
+    )
     assert len(pr44.pairs) == 2, f"expected 2 GEMM pairs, got {len(pr44.pairs)}"
+
+
+def _flat_chain_record(
+    layer_id: int,
+    ei: int,
+    cw: ChainWindow,
+    pr: PairingResult,
+) -> Dict[str, Any]:
+    sel = [c.execution_index for c in pr.classified if c.coarse_class == "routing_select"]
+    meta = [c.execution_index for c in pr.classified if c.coarse_class == "routing_metadata"]
+    return {
+        "layer_id": layer_id,
+        "anchor_ei": ei,
+        "anchor_validation_forward_ops": ANCHOR_VALIDATION_FORWARD_OPS,
+        "window_start_ei": cw.start_ei,
+        "window_end_ei": cw.end_ei,
+        "routing_select_eis": sel,
+        "routing_metadata_eis": meta,
+        "grouped_gemm_eis": list(pr.grouped_mm_eis),
+        "gemm_pairs": [
+            {"pair_id": p.pair_id, "gemm0_ei": p.gemm0_ei, "gemm1_ei": p.gemm1_ei}
+            for p in pr.pairs
+        ],
+        "odd_unpaired_grouped_mm_dropped": pr.odd_gemm_warning,
+    }
 
 
 def run_minimal_moe_dataflow(
@@ -99,9 +117,13 @@ def run_minimal_moe_dataflow(
     num_layers: int = 1,
     precision: str = "bfloat16",
     focus_layer: Optional[int] = None,
+    debug_full_layer: bool = False,
     moe_debug_log_path: Optional[Path] = None,
 ) -> Dict[str, Path]:
-    """Run minimal reconstruction; write ``moe_minimal_*.json`` and ``moe_dataflow.debug.txt``."""
+    """Minimal reconstruction; writes ``moe_minimal_*.json`` and ``moe_dataflow.debug.txt``.
+
+    If ``focus_layer`` is set, only that layer is parsed and emitted (iteration mode).
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -112,17 +134,34 @@ def run_minimal_moe_dataflow(
     ordered, ordering_source, order_note = order_classified_entries(classified_kernels, tp)
     streams, _ = build_ordered_stream_per_layer(ordered, num_layers=num_layers)
 
+    single_layer_mode = focus_layer is not None
+    layer_indices: List[int]
+    if single_layer_mode:
+        lid = int(focus_layer)
+        if lid < 0 or lid >= len(streams):
+            print(
+                f"[moe_dataflow] WARNING: --layer {lid} out of range (0..{len(streams)-1}); no output",
+                file=sys.stderr,
+            )
+            layer_indices = []
+        else:
+            layer_indices = [lid]
+    else:
+        layer_indices = list(range(len(streams)))
+
     all_chains: List[Dict[str, Any]] = []
     all_buf_layers: List[Dict[str, Any]] = []
-    anchor_lines: List[str] = []
-    chain_lines: List[str] = []
-    buffer_lines: List[str] = []
+    section_a: List[str] = []
+    section_b: List[str] = []
+    section_c: List[str] = []
+    section_d: List[str] = []
 
     layer0_candidates: List[int] = []
     layer0_decisions: Dict[int, Tuple[bool, str]] = {}
     accepted_for_assert: List[Tuple[int, int, PairingResult]] = []
 
-    for layer_id, layer_ops in enumerate(streams):
+    for layer_id in layer_indices:
+        layer_ops = streams[layer_id]
         candidates = find_gate_candidates(layer_ops)
         decisions: Dict[int, Tuple[bool, str]] = {}
         for ei in candidates:
@@ -131,10 +170,11 @@ def run_minimal_moe_dataflow(
             layer0_candidates = list(candidates)
             layer0_decisions = dict(decisions)
 
-        anchor_lines.extend(
-            format_anchor_lines(layer_id, candidates, decisions, focus_layer=focus_layer)
+        section_a.extend(
+            format_section_a_candidate_gates(
+                layer_id, candidates, decisions, single_layer_mode=single_layer_mode
+            )
         )
-        anchor_lines.append("")
 
         for ei in candidates:
             ok, reason = decisions[ei]
@@ -144,15 +184,7 @@ def run_minimal_moe_dataflow(
             pr = analyze_chain_window(layer_ops, cw.node_indices, ei)
             accepted_for_assert.append((layer_id, ei, pr))
 
-            chain_record = {
-                "layer_id": layer_id,
-                "anchor_ei": ei,
-                "anchor_validation_forward_ops": ANCHOR_VALIDATION_FORWARD_OPS,
-                "window_start_ei": cw.start_ei,
-                "window_end_ei": cw.end_ei,
-                "pairing": pairing_result_to_json_dict(pr),
-            }
-            all_chains.append(chain_record)
+            all_chains.append(_flat_chain_record(layer_id, ei, cw, pr))
 
             cb = build_chain_buffers(layer_ops, ei, pr, precision=precision)
             all_buf_layers.append(
@@ -164,27 +196,45 @@ def run_minimal_moe_dataflow(
                 }
             )
 
-            chain_lines.extend(
-                format_chain_lines(layer_id, ei, cw, pr, layer_ops, focus_layer=focus_layer)
+            section_b.extend(
+                format_section_b_routed_windows(
+                    layer_id,
+                    ei,
+                    cw,
+                    pr,
+                    layer_ops,
+                    debug_full_layer=debug_full_layer,
+                )
             )
-            chain_lines.append("")
-            buffer_lines.extend(format_buffer_lines(cb, focus_layer=focus_layer))
-            buffer_lines.append("")
+            section_b.append("")
+            section_c.extend(
+                format_section_c_gemm_pairs(
+                    layer_id,
+                    ei,
+                    pr,
+                    layer_ops,
+                    debug_full_layer=debug_full_layer,
+                )
+            )
+            section_c.append("")
+            section_d.extend(format_section_d_buffers(cb))
 
-    assert_reference_layer0_layout(
-        layer0_candidates=layer0_candidates,
-        layer0_decisions=layer0_decisions,
-        accepted_chains=accepted_for_assert,
-    )
+    if not single_layer_mode or focus_layer == 0:
+        assert_reference_layer0_layout(
+            layer0_candidates=layer0_candidates,
+            layer0_decisions=layer0_decisions,
+            accepted_chains=accepted_for_assert,
+        )
 
     trace_used = str(tp) if tp and Path(tp).is_file() else None
     dbg = render_debug(
         ordering_source=ordering_source,
         order_note=order_note,
         trace_path_used=trace_used,
-        anchor_section=anchor_lines,
-        chain_sections=chain_lines,
-        buffer_sections=buffer_lines,
+        section_a=section_a,
+        section_b=section_b,
+        section_c=section_c,
+        section_d=section_d,
     )
 
     p_chains = output_dir / "moe_minimal_chains.json"
@@ -221,7 +271,12 @@ def _cli() -> None:
         "--layer",
         type=int,
         default=None,
-        help="If set, only this layer gets full grouped-GEMM shape detail in debug",
+        help="Parse and emit only this layer (compact debug for that layer)",
+    )
+    parser.add_argument(
+        "--debug-full-layer",
+        action="store_true",
+        help="Include per-grouped-GEMM shape lines in Sections B/C",
     )
     parser.add_argument("--precision", type=str, default="bfloat16")
     parser.add_argument("--moe-num-layers", type=int, default=None)
@@ -243,6 +298,7 @@ def _cli() -> None:
         num_layers=num_layers,
         precision=args.precision,
         focus_layer=args.layer,
+        debug_full_layer=args.debug_full_layer,
     )
     print("Wrote:", paths)
 

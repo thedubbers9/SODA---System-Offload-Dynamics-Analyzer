@@ -13,11 +13,14 @@ Two-pass design — passes are always separate invocations:
     Instruments kernels tagged by expert_type in execution order.
     Provides in-context L1/L2 cache-line reuse and cross-expert data reuse.
 
-**Dataflow artifacts** — (1) Legacy path under ``generate_op_profile``:
-``op_pipeline.json``, ``dataflow_profile.json``, ``dataflow.debug.txt`` (see
-``soda.moe.dataflow``).  (2) **Minimal MoE chain** path (``soda.moe.moe_dataflow``,
-on by default): ``moe_minimal_chains.json``, ``moe_minimal_buffers.json``,
+**Dataflow artifacts** — **Minimal MoE chain** path (``soda.moe.moe_dataflow``, on
+by default): ``moe_minimal_chains.json``, ``moe_minimal_buffers.json``,
 ``moe_dataflow.debug.txt``.  Disable with ``--skip-moe-minimal-dataflow``.
+Optional ``--moe-parse-layer N`` parses one layer only; ``--moe-debug-full-layer``
+adds grouped-GEMM shape lines to the debug file.
+
+Legacy broad grouping (``soda.moe.dataflow`` → ``dataflow_profile.json``, etc.) is
+**off** unless ``--moe-legacy-dataflow`` is passed with ``--moe-profile``.
 
 Standalone CLI::
 
@@ -156,6 +159,8 @@ class MoEProfilePipeline:
                 trace_path=None,
                 num_layers=num_layers,
                 precision=precision,
+                focus_layer=getattr(self.args, "moe_parse_layer", None),
+                debug_full_layer=getattr(self.args, "moe_debug_full_layer", False),
                 moe_debug_log_path=moe_debug_path,
             )
             print(
@@ -175,17 +180,19 @@ class MoEProfilePipeline:
             output_path=op_profile_path,
             moe_debug_log_path=moe_debug_path,
             kernel_db_path=self.kernel_db_path,
+            emit_dataflow_artifacts=getattr(self.args, "moe_legacy_dataflow", False),
         )
         print(
             f"[MoE Profile] Op profile ({len(records)} records, "
             f"{num_layers} layers): {op_profile_path}"
         )
-        df_p = self.output_dir / "dataflow_profile.json"
-        if df_p.is_file():
-            print(
-                f"[MoE Profile] Dataflow (simulator handoff): {df_p} "
-                f"(see also op_pipeline.json, dataflow.debug.txt)"
-            )
+        if getattr(self.args, "moe_legacy_dataflow", False):
+            df_p = self.output_dir / "dataflow_profile.json"
+            if df_p.is_file():
+                print(
+                    f"[MoE Profile] Legacy dataflow (simulator handoff): {df_p} "
+                    f"(see also op_pipeline.json, dataflow.debug.txt)"
+                )
         print(f"[MoE Profile] MoE debug log: {moe_debug_path}")
 
         return report_path

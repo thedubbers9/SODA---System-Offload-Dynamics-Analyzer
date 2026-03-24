@@ -1,5 +1,11 @@
 # Copyright and architecture note:
 #
+# **Pipeline status:** The default ``--moe-profile`` path does **not** call this
+# module. Use ``--moe-legacy-dataflow`` (or ``emit_dataflow_artifacts=True`` in
+# ``generate_op_profile``) to emit ``dataflow_profile.json`` / broad
+# ``PipelineGroup`` heuristics. For routed-expert chains, use
+# ``soda.moe.moe_dataflow`` (minimal anchor-first parser).
+#
 # This module introduces an **architecture-facing approximation** of local MoE
 # dataflow between classified kernel-database entries.  It is intentionally *not*
 # an exact tensor-level dependence graph recovered from PyTorch: SODA's
