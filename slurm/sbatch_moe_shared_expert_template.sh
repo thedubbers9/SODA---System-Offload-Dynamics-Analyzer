@@ -172,15 +172,16 @@ echo "Outputs:"
 echo "  report.json      $EXP_DIR/report.json"
 echo "  summary.md       $EXP_DIR/summary.md"
 echo "  kernel_database  $EXP_DIR/kernel_database.json"
+echo "  execution_trace  $EXP_DIR/moe_profile/execution_trace.json"
 echo "  op_profile.json  $EXP_DIR/moe_profile/op_profile.json"
 echo "  moe_profile.json $EXP_DIR/moe_profile/moe_profile.json"
 
-if [ -f "$EXP_DIR/moe_profile/op_profile.json" ]; then
-	total=$(python -c "import json; d=json.load(open('$EXP_DIR/moe_profile/op_profile.json')); print(len(d))")
-	shared=$(python -c "import json; d=json.load(open('$EXP_DIR/moe_profile/op_profile.json')); print(sum(1 for r in d if r.get('is_shared_expert')))" )
+if [ -f "$EXP_DIR/moe_profile/execution_trace.json" ]; then
+	total=$(python -c "import json; d=json.load(open('$EXP_DIR/moe_profile/execution_trace.json')); print(len(d))")
+	shared=$(python -c "import json; d=json.load(open('$EXP_DIR/moe_profile/execution_trace.json')); print(sum(1 for r in d if r.get('is_shared_expert')))" )
 	echo ""
-	echo "  op_profile records:    $total"
-	echo "  shared expert records: $shared"
-	echo "  non-shared records:    $((total - shared))"
+	echo "  execution_trace rows:  $total"
+	echo "  shared expert rows:    $shared"
+	echo "  non-shared rows:       $((total - shared))"
 fi
 

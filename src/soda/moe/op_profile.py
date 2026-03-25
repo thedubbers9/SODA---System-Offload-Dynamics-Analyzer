@@ -1,22 +1,27 @@
-"""Per-layer per-op kernel profile generator.
+"""Trace-driven MoE execution profile.
 
-Generates op_profile.json: one record per unique kernel invocation type per layer
-across the full model, with is_shared_expert flag for downstream filtering.
+`trace.json` (Chrome trace) is the only ordering / layering authority.
+Kernel-database classification supplies expert_type / structural_role for NCU
+attachment and MoE-specific roles.
 
-Data source: classified kernel DB entries (from classify_kernel_entries()).
-No GPU required — derived from kernel_database.json + MoE classification.
+Pipeline:
+  ordered trace → event typing → launch↔GPU join → parent ATen attach →
+  noise filtering → layer segmentation → per-GPU row + NCU attach →
+  `execution_trace.json` + aggregated `op_profile.json`.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import math
+from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+from soda.common.data import clean_kernel_name
 from soda.moe.detect import append_moe_op_profile_debug, moe_op_profile_debug_path
 
-# ATen ops that represent GEMM-type operations (matches detect.py GEMM_OPS).
 _GEMM_OPS = frozenset({
     "aten::linear",
     "aten::mm",
@@ -24,15 +29,68 @@ _GEMM_OPS = frozenset({
     "aten::addmm",
     "aten::matmul",
     "aten::_scaled_mm",
+    "aten::_grouped_mm",
+})
+
+_MEANINGFUL_PREFIXES = (
+    "aten::rms_norm",
+    "aten::native_layer_norm",
+    "aten::layer_norm",
+    "aten::softmax",
+    "aten::_softmax",
+    "aten::scaled_dot_product_attention",
+    "aten::silu",
+    "aten::gelu",
+    "aten::relu",
+    "aten::mul",
+    "aten::add",
+    "aten::div",
+    "aten::sub",
+    "aten::linear",
+    "aten::mm",
+    "aten::bmm",
+    "aten::addmm",
+    "aten::matmul",
+    "aten::_scaled_mm",
+    "aten::_grouped_mm",
+    "aten::einsum",
+)
+
+_NOISE_OPS = frozenset({
+    "aten::empty",
+    "aten::empty_strided",
+    "aten::empty_like",
+    "aten::to",
+    "aten::_to_copy",
+    "aten::lift_fresh",
+    "aten::lift_fresh_copy",
+    "aten::as_strided",
+    "aten::view",
+    "aten::_unsafe_view",
+    "aten::reshape",
+    "aten::detach",
+    "aten::expand",
+    "aten::expand_as",
+    "aten::slice",
+    "aten::narrow",
+    "aten::alias",
+    "aten::_reshape_alias",
+    "aten::zero_",
+    "aten::fill_",
+})
+
+_LAYER_ANCHOR_OPS = frozenset({
+    "aten::rms_norm",
+    "aten::native_layer_norm",
+    "aten::layer_norm",
 })
 
 
 # ---------------------------------------------------------------------------
-# Public helpers (exported for tests)
+# dtype / HBM helpers (shape estimates when NCU missing)
 # ---------------------------------------------------------------------------
 
 def _dtype_bytes(precision: str) -> int:
-    """Return bytes per element for the given precision string."""
     _MAP = {
         "bfloat16": 2,
         "float16": 2,
@@ -45,214 +103,11 @@ def _dtype_bytes(precision: str) -> int:
     return _MAP.get(precision.lower(), 2)
 
 
-def _compute_hbm_fields(
-    aten_op_name: str,
-    input_dims: List,
-    dtype_bytes: int,
-) -> Dict:
-    """Compute weight_bytes, activation_bytes, hbm_bytes, kv_bytes, flops.
-
-    For GEMM ops, derives M, K, N from input shapes and returns shape-based
-    estimates.  For non-GEMM, returns activation bytes from first input only.
-
-    Args:
-        aten_op_name: ATen op name (e.g., "aten::linear").
-        input_dims:   input_dims list from kernel DB entry's aten_op dict.
-        dtype_bytes:  Bytes per element for the run precision.
-
-    Returns:
-        Dict with keys: flops, weight_bytes, activation_bytes, hbm_bytes, kv_bytes.
-    """
-    _zero = {"flops": 0, "weight_bytes": 0.0, "activation_bytes": 0.0,
-             "hbm_bytes": 0.0, "kv_bytes": 0.0}
-
-    if not input_dims:
-        return _zero
-
-    # addmm(bias, input, weight, ...) → activation at [1], weight at [2]
-    if aten_op_name == "aten::addmm":
-        act_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
-        weight_shape = _normalize_shape(input_dims[2]) if len(input_dims) > 2 else []
-    else:
-        act_shape = _normalize_shape(input_dims[0]) if len(input_dims) > 0 else []
-        weight_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
-
-    if aten_op_name not in _GEMM_OPS:
-        # Non-GEMM: report activation bytes from first input.
-        # Some ops (aten::cat, aten::stack) receive a *list of tensors* as
-        # input_dims[0], e.g. [[1,16,1024,64],[1,16,1024,64]].  Detect this
-        # (list-of-lists) and sum each tensor's bytes individually instead of
-        # blindly flattening into one huge product.
-        raw_first = input_dims[0] if input_dims else []
-        if raw_first and isinstance(raw_first, (list, tuple)) and raw_first and isinstance(raw_first[0], (list, tuple)):
-            # List of tensor shapes: sum each tensor's bytes.
-            act_bytes = float(sum(_product(t) for t in raw_first) * dtype_bytes)
-        else:
-            act_bytes = float(_product(act_shape) * dtype_bytes)
-        return {**_zero, "activation_bytes": act_bytes, "hbm_bytes": act_bytes}
-
-    if not act_shape or not weight_shape:
-        return _zero
-
-    kv_bytes = 0.0
-
-    if aten_op_name == "aten::linear":
-        # weight stored as (N, K); input as (..., K).
-        N = int(weight_shape[0]) if len(weight_shape) > 0 else 1
-        K = int(weight_shape[1]) if len(weight_shape) > 1 else 1
-        # Flatten all batch dims of the activation.
-        M = _product(act_shape[:-1]) if len(act_shape) > 1 else int(act_shape[0])
-        flops = 2 * M * K * N
-        weight_bytes = float(N * K * dtype_bytes)
-        activation_bytes = float((M * K + M * N) * dtype_bytes)
-
-    elif aten_op_name in ("aten::mm", "aten::addmm"):
-        # mm:    (M, K) × (K, N)  → weight_shape = (K, N)
-        # addmm: bias, (M, K), (K, N) → weight_shape = (K, N) (extracted above)
-        K = int(weight_shape[0]) if len(weight_shape) > 0 else 1
-        N = int(weight_shape[1]) if len(weight_shape) > 1 else 1
-        M = _product(act_shape[:-1]) if len(act_shape) > 1 else int(act_shape[0])
-        flops = 2 * M * K * N
-        weight_bytes = float(K * N * dtype_bytes)
-        activation_bytes = float((M * K + M * N) * dtype_bytes)
-
-    elif aten_op_name == "aten::bmm":
-        # Standard 3D: (B, M, K) × (B, K, N)
-        # Attention 4D: (B, H, M, K) × (B, H, K, N)
-        is_4d = len(act_shape) == 4 or len(weight_shape) == 4
-        if is_4d:
-            if len(weight_shape) == 4:
-                B = int(weight_shape[0])
-                H = int(weight_shape[1])
-                K = int(weight_shape[2])
-                N = int(weight_shape[3])
-            else:
-                B, H, K, N = 1, 1, 1, 1
-            M = int(act_shape[2]) if len(act_shape) > 2 else 1
-            flops = 2 * B * H * M * K * N
-            weight_bytes = 0.0  # both tensors are activations in attention
-            activation_bytes = float(
-                (_product(act_shape) + _product(weight_shape) + B * H * M * N)
-                * dtype_bytes
-            )
-            kv_bytes = float(_product(weight_shape) * dtype_bytes)
-        else:
-            # 3D bmm
-            if len(weight_shape) >= 3:
-                B = int(weight_shape[0])
-                K = int(weight_shape[1])
-                N = int(weight_shape[2])
-            else:
-                B, K, N = 1, 1, 1
-            M = int(act_shape[1]) if len(act_shape) > 1 else 1
-            flops = 2 * B * M * K * N
-            weight_bytes = 0.0
-            activation_bytes = float(
-                (_product(act_shape) + _product(weight_shape) + B * M * N)
-                * dtype_bytes
-            )
-
-    elif aten_op_name in ("aten::matmul", "aten::_scaled_mm"):
-        if len(act_shape) >= 2 and len(weight_shape) >= 2:
-            M = _product(act_shape[:-1])
-            K = int(act_shape[-1])
-            N = int(weight_shape[-1])
-            flops = 2 * M * K * N
-            weight_bytes = float(_product(weight_shape) * dtype_bytes)
-            activation_bytes = float((_product(act_shape) + M * N) * dtype_bytes)
-        else:
-            return _zero
-
-    else:
-        return _zero
-
-    hbm_bytes = weight_bytes + activation_bytes
-    return {
-        "flops": flops,
-        "weight_bytes": weight_bytes,
-        "activation_bytes": activation_bytes,
-        "hbm_bytes": hbm_bytes,
-        "kv_bytes": kv_bytes,
-    }
-
-
-def _infer_structural_op_name(
-    aten_op_name: str,
-    structural_role: str,
-    input_dims: List,
-) -> str:
-    """Map (aten_op, structural_role, input_dims) to a human-readable op_name."""
-    # Non-GEMM special cases.
-    if aten_op_name in ("aten::rms_norm",):
-        return "rmsnorm"
-    if aten_op_name in ("aten::native_layer_norm", "aten::layer_norm"):
-        return "layernorm"
-    if aten_op_name in ("aten::softmax", "aten::_softmax"):
-        return "softmax"
-    if aten_op_name in ("aten::silu", "aten::gelu", "aten::relu"):
-        return "activation"
-    if aten_op_name in ("aten::mul", "aten::add", "aten::div", "aten::sub"):
-        return "elementwise"
-
-    # bmm: check 4D vs 3D.
-    if aten_op_name == "aten::bmm":
-        act_shape = _normalize_shape(input_dims[0]) if input_dims else []
-        weight_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
-        if len(act_shape) == 4 or len(weight_shape) == 4:
-            return "attn_bmm_kv"
-        return "bmm"
-
-    # GEMM ops: classify by structural role.
-    if aten_op_name in _GEMM_OPS:
-        if structural_role == "shared_expert_expand":
-            return "shared_expert_expand"
-        if structural_role == "shared_expert_down":
-            return "shared_expert_down"
-        if structural_role == "routed_expert_expand":
-            return "routed_expert_expand"
-        if structural_role == "routed_expert_down":
-            return "routed_expert_down"
-        if structural_role == "moe_gate":
-            return "moe_gate_proj"
-        if structural_role == "attention":
-            return "attn_proj"
-        return "linear"
-
-    # Fallback: strip the aten:: prefix.
-    return aten_op_name.split("::")[-1] if "::" in aten_op_name else aten_op_name
-
-
-def _detect_num_layers(classified_kernels: List[Dict]) -> int:
-    """Detect number of transformer layers from shared expert entry frequencies.
-
-    Uses GCD of all shared expert entry frequencies as the proxy for num_layers.
-    Returns 1 if no shared expert entries are found (safe default).
-    """
-    shared_freqs = [
-        e["statistics"]["frequency"]
-        for e in classified_kernels
-        if e.get("expert_type") == "shared_expert"
-        and e.get("statistics", {}).get("frequency", 0) > 0
-    ]
-    if not shared_freqs:
-        return 1
-    result = shared_freqs[0]
-    for f in shared_freqs[1:]:
-        result = math.gcd(result, f)
-    return max(1, result)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
 def _normalize_shape(shape) -> List[int]:
-    """Normalize possibly nested shape containers into a flat int list."""
     if shape is None:
         return []
     if isinstance(shape, (int, float)):
         return [int(shape)]
-
     normalized: List[int] = []
     stack = [shape]
     while stack:
@@ -273,386 +128,665 @@ def _normalize_shape(shape) -> List[int]:
             normalized.append(int(current))
             continue
         raise TypeError(f"Unsupported shape element type: {type(current)}")
-
     return normalized
 
+
 def _product(shape) -> int:
-    """Return the integer product of a shape list; 0 for empty."""
     dims = _normalize_shape(shape)
     if not dims:
         return 0
-    result = 1
+    r = 1
     for d in dims:
-        result *= int(d)
-    return result
+        r *= int(d)
+    return r
 
 
-def _ops_per_layer(freq: int, num_layers: int) -> int:
-    """Return ops per layer; 0 if freq is not evenly divisible by num_layers."""
-    if num_layers <= 0 or freq <= 0:
-        return 0
-    if freq % num_layers == 0:
-        return freq // num_layers
-    return 0
+def _compute_hbm_fields(
+    aten_op_name: str,
+    input_dims: List,
+    dtype_bytes: int,
+) -> Dict[str, float]:
+    _zero: Dict[str, float] = {
+        "flops": 0.0,
+        "weight_bytes": 0.0,
+        "activation_bytes": 0.0,
+        "hbm_bytes": 0.0,
+        "kv_bytes": 0.0,
+    }
+    if not input_dims:
+        return _zero
 
+    if aten_op_name == "aten::addmm":
+        act_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
+        weight_shape = _normalize_shape(input_dims[2]) if len(input_dims) > 2 else []
+    else:
+        act_shape = _normalize_shape(input_dims[0]) if len(input_dims) > 0 else []
+        weight_shape = _normalize_shape(input_dims[1]) if len(input_dims) > 1 else []
 
-def _make_record(
-    layer_id: int,
-    op_name: str,
-    hbm_fields: Dict,
-    hbm_byte_data_from_ncu: bool,
-    cta_count: int,
-    latency_us: float,
-    is_shared: bool,
-    expert_type: str,
-    structural_role: str,
-    observed: bool,
-    reconstruction_source: str,
-    source_entry_id: Optional[str] = None,
-    template_alias: Optional[str] = None,
-) -> Dict:
-    """Build a single op_profile record dict."""
-    shared_expert_bytes = hbm_fields["hbm_bytes"] if is_shared else 0.0
+    if aten_op_name not in _GEMM_OPS or aten_op_name == "aten::_grouped_mm":
+        if aten_op_name == "aten::_grouped_mm":
+            raw_first = input_dims[0] if input_dims else []
+            if (
+                raw_first
+                and isinstance(raw_first, (list, tuple))
+                and raw_first
+                and isinstance(raw_first[0], (list, tuple))
+            ):
+                act_bytes = float(sum(_product(t) for t in raw_first) * dtype_bytes)
+            else:
+                act_bytes = float(_product(act_shape) * dtype_bytes)
+            return {**_zero, "activation_bytes": act_bytes, "hbm_bytes": act_bytes}
+
+        raw_first = input_dims[0] if input_dims else []
+        if (
+            raw_first
+            and isinstance(raw_first, (list, tuple))
+            and raw_first
+            and isinstance(raw_first[0], (list, tuple))
+        ):
+            act_bytes = float(sum(_product(t) for t in raw_first) * dtype_bytes)
+        else:
+            act_bytes = float(_product(act_shape) * dtype_bytes)
+        return {**_zero, "activation_bytes": act_bytes, "hbm_bytes": act_bytes}
+
+    if not act_shape or not weight_shape:
+        return _zero
+
+    kv_bytes = 0.0
+
+    if aten_op_name == "aten::linear":
+        N = int(weight_shape[0]) if len(weight_shape) > 0 else 1
+        K = int(weight_shape[1]) if len(weight_shape) > 1 else 1
+        M = _product(act_shape[:-1]) if len(act_shape) > 1 else int(act_shape[0])
+        flops = float(2 * M * K * N)
+        weight_bytes = float(N * K * dtype_bytes)
+        activation_bytes = float((M * K + M * N) * dtype_bytes)
+
+    elif aten_op_name in ("aten::mm", "aten::addmm"):
+        K = int(weight_shape[0]) if len(weight_shape) > 0 else 1
+        N = int(weight_shape[1]) if len(weight_shape) > 1 else 1
+        M = _product(act_shape[:-1]) if len(act_shape) > 1 else int(act_shape[0])
+        flops = float(2 * M * K * N)
+        weight_bytes = float(K * N * dtype_bytes)
+        activation_bytes = float((M * K + M * N) * dtype_bytes)
+
+    elif aten_op_name == "aten::bmm":
+        is_4d = len(act_shape) == 4 or len(weight_shape) == 4
+        if is_4d:
+            if len(weight_shape) == 4:
+                B = int(weight_shape[0])
+                H = int(weight_shape[1])
+                K = int(weight_shape[2])
+                N = int(weight_shape[3])
+            else:
+                B, H, K, N = 1, 1, 1, 1
+            M = int(act_shape[2]) if len(act_shape) > 2 else 1
+            flops = float(2 * B * H * M * K * N)
+            weight_bytes = 0.0
+            activation_bytes = float(
+                (_product(act_shape) + _product(weight_shape) + B * H * M * N)
+                * dtype_bytes
+            )
+            kv_bytes = float(_product(weight_shape) * dtype_bytes)
+        else:
+            if len(weight_shape) >= 3:
+                B = int(weight_shape[0])
+                K = int(weight_shape[1])
+                N = int(weight_shape[2])
+            else:
+                B, K, N = 1, 1, 1
+            M = int(act_shape[1]) if len(act_shape) > 1 else 1
+            flops = float(2 * B * M * K * N)
+            weight_bytes = 0.0
+            activation_bytes = float(
+                (_product(act_shape) + _product(weight_shape) + B * M * N)
+                * dtype_bytes
+            )
+
+    elif aten_op_name in ("aten::matmul", "aten::_scaled_mm"):
+        if len(act_shape) >= 2 and len(weight_shape) >= 2:
+            M = float(_product(act_shape[:-1]))
+            K = int(act_shape[-1])
+            N = int(weight_shape[-1])
+            flops = 2.0 * M * K * N
+            weight_bytes = float(_product(weight_shape) * dtype_bytes)
+            activation_bytes = float((_product(act_shape) + M * N) * dtype_bytes)
+        else:
+            return _zero
+    else:
+        return _zero
+
+    hbm_bytes = weight_bytes + activation_bytes
     return {
-        "layer_id": layer_id,
-        "op_name": op_name,
-        "flops": hbm_fields["flops"],
-        "hbm_bytes": hbm_fields["hbm_bytes"],
-        "HBM_byte_data_from_ncu": hbm_byte_data_from_ncu,
-        "weight_bytes": hbm_fields["weight_bytes"],
-        "activation_bytes": hbm_fields["activation_bytes"],
-        "kv_bytes": hbm_fields["kv_bytes"],
-        "shared_expert_bytes": shared_expert_bytes,
-        "cta_count": cta_count,
-        "latency_us": latency_us,
-        "is_shared_expert": is_shared,
-        "expert_type": expert_type,
-        "structural_role": structural_role,
-        "observed": observed,
-        "reconstruction_source": reconstruction_source,
-        "source_entry_id": source_entry_id,
-        "template_alias": template_alias,
+        "flops": flops,
+        "weight_bytes": weight_bytes,
+        "activation_bytes": activation_bytes,
+        "hbm_bytes": hbm_bytes,
+        "kv_bytes": kv_bytes,
     }
 
 
-def _record_signature(r: Dict) -> Tuple:
-    """Signature used to dedupe equivalent structural records."""
-    return (
-        r.get("structural_role"),
-        int(r.get("flops", 0)),
-        float(r.get("weight_bytes", 0.0)),
-        float(r.get("activation_bytes", 0.0)),
-        int(r.get("cta_count", 0)),
-        round(float(r.get("latency_us", 0.0)), 6),
-        int(bool(r.get("HBM_byte_data_from_ncu", False))),
-    )
+# ---------------------------------------------------------------------------
+# Trace parsing & joins
+# ---------------------------------------------------------------------------
+
+def _is_meaningful_aten(name: str) -> bool:
+    if name in _NOISE_OPS:
+        return False
+    return any(name.startswith(p) or name == p for p in _MEANINGFUL_PREFIXES)
 
 
-def _select_representatives(records: List[Dict], target_count: int) -> List[Dict]:
-    """Pick stable representatives from possibly duplicated observed records."""
-    if not records or target_count <= 0:
-        return []
-    buckets: Dict[Tuple, List[Dict]] = {}
-    for r in records:
-        sig = _record_signature(r)
-        buckets.setdefault(sig, []).append(r)
-    ranked = sorted(
-        buckets.values(),
-        key=lambda rs: (-len(rs), float(rs[0].get("latency_us", 0.0))),
-    )
-    reps = [rs[0] for rs in ranked[:target_count]]
-    while reps and len(reps) < target_count:
-        reps.append(dict(reps[-1]))
-    return reps
+def _is_trivial_copy(name: str) -> bool:
+    if name not in ("aten::copy_", "aten::clone", "aten::contiguous"):
+        return False
+    return True
 
 
-def _clone_record_with_alias(
-    base: Dict,
-    op_name: str,
-    template_alias: str,
-    observed: bool,
-    reconstruction_source: str,
-    structural_role: Optional[str] = None,
-) -> Dict:
-    out = dict(base)
-    out["op_name"] = op_name
-    out["template_alias"] = template_alias
-    out["observed"] = observed
-    out["reconstruction_source"] = reconstruction_source
-    if structural_role is not None:
-        out["structural_role"] = structural_role
+def _filtered_meaningful(name: str) -> bool:
+    if not _is_meaningful_aten(name):
+        return False
+    if _is_trivial_copy(name):
+        return False
+    return True
+
+
+def _parse_trace_ordered(trace: Dict[str, Any]) -> Tuple[
+    List[Dict[str, Any]],
+    Dict[int, Dict[str, Any]],
+    Dict[int, Dict[str, Any]],
+]:
+    """Return (aten_ordered, aten_by_ext_id, launches_by_corr)."""
+    aten_ordered: List[Dict[str, Any]] = []
+    aten_by_ext_id: Dict[int, Dict[str, Any]] = {}
+    launches_by_corr: Dict[int, Dict[str, Any]] = {}
+
+    for event in trace.get("traceEvents", []):
+        if event.get("ph") != "X":
+            continue
+        cat = event.get("cat", "")
+        name = event.get("name", "")
+        args = event.get("args", {}) or {}
+
+        if cat == "cpu_op" and name.startswith("aten::"):
+            ext_id = args.get("External id")
+            rec = {
+                "name": name,
+                "ts": event.get("ts", 0),
+                "dur": event.get("dur", 0) or 0,
+                "external_id": ext_id,
+                "input_dims": args.get("Input Dims", []),
+                "input_type": args.get("Input type", []),
+                "input_strides": args.get("Input Strides", []),
+                "concrete_inputs": args.get("Concrete Inputs", []),
+                "aten_index": len(aten_ordered),
+            }
+            aten_ordered.append(rec)
+            if ext_id is not None:
+                aten_by_ext_id[int(ext_id)] = rec
+
+        elif (cat in ("cuda_runtime", "cuda_driver")) and "LaunchKernel" in name:
+            corr = args.get("correlation")
+            if corr is not None:
+                c = int(corr)
+                launches_by_corr[c] = {
+                    "name": name,
+                    "ts": event.get("ts", 0),
+                    "dur": event.get("dur", 0) or 0,
+                    "correlation": c,
+                    "external_id": args.get("External id"),
+                }
+
+    return aten_ordered, aten_by_ext_id, launches_by_corr
+
+
+def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """GPU kernels and memcpys in strict trace file order."""
+    out: List[Dict[str, Any]] = []
+    for event in trace.get("traceEvents", []):
+        if event.get("ph") != "X":
+            continue
+        cat = event.get("cat", "")
+        name = event.get("name", "")
+        args = event.get("args", {}) or {}
+        ts = event.get("ts", 0)
+        dur = event.get("dur", 0) or 0
+
+        if cat == "kernel":
+            out.append({
+                "kind": "gpu_kernel",
+                "name": name,
+                "ts": ts,
+                "dur": dur,
+                "correlation": args.get("correlation"),
+                "external_id": args.get("External id"),
+                "stream": args.get("stream"),
+                "device": args.get("device"),
+                "grid": args.get("grid", [0, 0, 0]),
+                "block": args.get("block", [0, 0, 0]),
+            })
+        elif cat in ("gpu_memcpy", "gpu_memset"):
+            out.append({
+                "kind": "gpu_memcpy",
+                "name": name,
+                "cat": cat,
+                "ts": ts,
+                "dur": dur,
+                "correlation": args.get("correlation"),
+                "stream": args.get("stream"),
+                "device": args.get("device"),
+            })
     return out
 
 
-def _global_canonical_by_role(records: List[Dict], role: str) -> Optional[Dict]:
+def _parent_aten(
+    gpu_ts: float,
+    ext_hint: Optional[int],
+    aten_by_ext_id: Dict[int, Dict[str, Any]],
+    aten_ordered: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if ext_hint is not None and int(ext_hint) in aten_by_ext_id:
+        return aten_by_ext_id[int(ext_hint)]
+
     candidates = [
-        r for r in records
-        if r.get("layer_id", -1) >= 0 and r.get("structural_role") == role and r.get("observed")
+        op for op in aten_ordered
+        if op["ts"] <= gpu_ts < op["ts"] + op["dur"]
     ]
-    reps = _select_representatives(candidates, 1)
-    return reps[0] if reps else None
+    if candidates:
+        return min(candidates, key=lambda o: o["dur"])
+    prev = None
+    for op in aten_ordered:
+        if op["ts"] <= gpu_ts:
+            prev = op
+    return prev
 
 
-def _reconstruct_shared_expert_template(
-    records: List[Dict],
+def _compute_layer_boundaries(
+    aten_ordered: List[Dict[str, Any]],
     num_layers: int,
-    moe_debug_log_path: Optional[Union[str, Path]] = None,
-) -> List[Dict]:
-    """Reconstruct per-layer shared expert template into semantic aliases."""
-    EXPECTED_SHARED_TEMPLATE = {
-        "shared_expert_expand": 2,
-        "shared_expert_down": 1,
-    }
-    shared_roles = set(EXPECTED_SHARED_TEMPLATE.keys())
+) -> List[int]:
+    """Return aten_index where each layer starts (len == num_layers)."""
+    if num_layers <= 0:
+        return []
 
-    passthrough = [r for r in records if r.get("structural_role") not in shared_roles]
-    shared = [r for r in records if r.get("structural_role") in shared_roles and r.get("layer_id", -1) >= 0]
+    anchor_indices = [
+        int(op["aten_index"])
+        for op in aten_ordered
+        if _filtered_meaningful(op["name"]) and op["name"] in _LAYER_ANCHOR_OPS
+    ]
 
-    per_layer: Dict[int, Dict[str, List[Dict]]] = {
-        layer_id: {"shared_expert_expand": [], "shared_expert_down": []}
-        for layer_id in range(num_layers)
-    }
-    for r in shared:
-        layer_id = int(r.get("layer_id", -1))
-        if layer_id in per_layer:
-            per_layer[layer_id][r.get("structural_role", "other")].append(r)
+    if len(anchor_indices) >= num_layers and len(anchor_indices) % num_layers == 0:
+        step = len(anchor_indices) // num_layers
+        return [anchor_indices[i * step] for i in range(num_layers)]
 
-    global_expand = _global_canonical_by_role(shared, "shared_expert_expand")
-    global_down = _global_canonical_by_role(shared, "shared_expert_down")
+    if len(anchor_indices) >= num_layers:
+        step = max(1, len(anchor_indices) // num_layers)
+        return [anchor_indices[min(i * step, len(anchor_indices) - 1)]
+                for i in range(num_layers)]
 
-    reconstructed: List[Dict] = []
-    for layer_id in range(num_layers):
-        expands_obs = _select_representatives(per_layer[layer_id]["shared_expert_expand"], 2)
-        downs_obs = _select_representatives(per_layer[layer_id]["shared_expert_down"], 1)
+    meaningful_idx = [
+        int(op["aten_index"])
+        for op in aten_ordered
+        if _filtered_meaningful(op["name"])
+    ]
+    if len(meaningful_idx) < num_layers:
+        return [0] + [1] * (num_layers - 1)
 
-        synth_expands = 0
-        synth_downs = 0
+    boundaries = []
+    chunk = len(meaningful_idx) / num_layers
+    for L in range(num_layers):
+        slot = int(round(L * chunk))
+        slot = min(slot, len(meaningful_idx) - 1)
+        boundaries.append(meaningful_idx[slot])
+    for i in range(1, len(boundaries)):
+        if boundaries[i] <= boundaries[i - 1]:
+            boundaries[i] = boundaries[i - 1] + 1
+    return boundaries
 
-        if len(expands_obs) >= 2:
-            expands = expands_obs[:2]
-        elif len(expands_obs) == 1:
-            expands = [expands_obs[0], dict(expands_obs[0])]
-            synth_expands += 1
-        else:
-            expands = []
-            if global_expand is not None:
-                expands = [dict(global_expand), dict(global_expand)]
-                synth_expands += 2
-            elif downs_obs:
-                expands = [dict(downs_obs[0]), dict(downs_obs[0])]
-                synth_expands += 2
 
-        if downs_obs:
-            down = downs_obs[0]
-        elif global_down is not None:
-            down = dict(global_down)
-            synth_downs += 1
-        elif expands:
-            down = dict(expands[0])
-            synth_downs += 1
-        else:
-            down = None
+def _layer_id_for_aten_index(
+    aten_index: int,
+    layer_starts: List[int],
+    num_layers: int,
+) -> int:
+    if not layer_starts or num_layers <= 0:
+        return 0
+    pos = bisect.bisect_right(layer_starts, aten_index) - 1
+    return int(min(max(pos, 0), num_layers - 1))
 
-        append_moe_op_profile_debug(
-            moe_debug_log_path,
-            f"[moe.reconstruct] layer={layer_id} observed_expands={len(expands_obs)} "
-            f"observed_downs={len(downs_obs)} synthesized_expands={synth_expands} "
-            f"synthesized_downs={synth_downs}",
-        )
 
-        if len(expands) < 2 or down is None:
+def _match_kernel_db_entry(
+    cleaned_kernel: str,
+    aten_name: str,
+    input_dims: List,
+    classified: List[Dict],
+) -> Optional[Dict]:
+    best = None
+    best_score = -1
+    for entry in classified:
+        raw = entry.get("kernel", {}).get("raw_name", "") or ""
+        eclean = entry.get("kernel", {}).get("name", "") or ""
+        if clean_kernel_name(raw) != cleaned_kernel and eclean != cleaned_kernel:
             continue
-
-        gate_obs = bool(expands_obs)
-        up_obs = len(expands_obs) >= 2
-        down_obs = bool(downs_obs)
-
-        gate_source = "trace" if gate_obs else "template_from_matching_role"
-        up_source = "trace" if up_obs else "template_from_matching_role"
-        down_source = "trace" if down_obs else "template_from_matching_role"
-
-        gate_struct = dict(expands[0])
-        gate_struct["layer_id"] = layer_id
-        gate_struct["structural_role"] = "shared_expert_expand"
-        reconstructed.append(_clone_record_with_alias(
-            base=gate_struct,
-            op_name="shared_expert_gate_proj",
-            template_alias="gate_proj",
-            observed=gate_obs,
-            reconstruction_source=gate_source,
-            structural_role="shared_expert_expand",
-        ))
-
-        up_struct = dict(expands[1])
-        up_struct["layer_id"] = layer_id
-        up_struct["structural_role"] = "shared_expert_expand"
-        reconstructed.append(_clone_record_with_alias(
-            base=up_struct,
-            op_name="shared_expert_up_proj",
-            template_alias="up_proj",
-            observed=up_obs,
-            reconstruction_source=up_source,
-            structural_role="shared_expert_expand",
-        ))
-
-        down_struct = dict(down)
-        down_struct["layer_id"] = layer_id
-        down_struct["structural_role"] = "shared_expert_down"
-        reconstructed.append(_clone_record_with_alias(
-            base=down_struct,
-            op_name="shared_expert_down_proj",
-            template_alias="down_proj",
-            observed=down_obs,
-            reconstruction_source=down_source,
-            structural_role="shared_expert_down",
-        ))
-
-    return passthrough + reconstructed
+        opn = entry.get("aten_op", {}).get("name", "")
+        score = 2 if opn == aten_name else 1
+        dims = entry.get("aten_op", {}).get("input_dims", [])
+        if dims and input_dims and dims == input_dims:
+            score += 2
+        if score > best_score:
+            best_score = score
+            best = entry
+    return best
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _infer_semantic_role(
+    aten_name: str,
+    expert_type: str,
+    structural_role: str,
+    input_dims: Optional[List] = None,
+) -> str:
+    if structural_role == "moe_gate" or expert_type == "gate":
+        return "moe_gate"
+    if structural_role == "shared_expert_expand":
+        return "shared_expert_expand"
+    if structural_role == "shared_expert_down":
+        return "shared_expert_down"
+    if structural_role == "routed_expert_expand":
+        return "routed_expert_expand"
+    if structural_role == "routed_expert_down":
+        return "routed_expert_down"
+    if expert_type == "attention" or structural_role == "attention":
+        return "attention"
+    if "softmax" in aten_name or aten_name == "aten::scaled_dot_product_attention":
+        return "attention"
+    if "norm" in aten_name or "rms_norm" in aten_name:
+        return "norm"
+    if aten_name in (
+        "aten::mul", "aten::add", "aten::div", "aten::sub",
+        "aten::silu", "aten::gelu", "aten::relu",
+    ):
+        return "elementwise"
+    if aten_name in _GEMM_OPS:
+        if aten_name == "aten::bmm":
+            act_shape = _normalize_shape(input_dims[0]) if input_dims else []
+            w_shape = _normalize_shape(input_dims[1]) if input_dims and len(input_dims) > 1 else []
+            if len(act_shape) == 4 or len(w_shape) == 4:
+                return "attention"
+            return "bmm"
+        if aten_name == "aten::_grouped_mm":
+            return "moe_grouped_gemm"
+        if expert_type == "routed_expert":
+            return "routed_expert_expand"
+        if expert_type == "shared_expert":
+            return "shared_expert_expand"
+        return "linear"
+    if aten_name in ("aten::copy_", "aten::clone", "aten::contiguous"):
+        return "copy / other"
+    return "copy / other"
+
+
+def detect_num_layers_from_shared_patterns(classified: List[Dict]) -> int:
+    """Fallback: GCD of shared-expert invocation counts from kernel DB (not ordering)."""
+    shared_freqs = [
+        int(e.get("statistics", {}).get("frequency", 0))
+        for e in classified
+        if e.get("expert_type") == "shared_expert"
+        and int(e.get("statistics", {}).get("frequency", 0) or 0) > 0
+    ]
+    if not shared_freqs:
+        return 1
+    g = shared_freqs[0]
+    for f in shared_freqs[1:]:
+        g = math.gcd(g, f)
+    return max(1, g)
+
+
+def build_execution_trace(
+    trace_path: Path,
+    classified: List[Dict],
+    num_layers: int,
+    precision: str = "bfloat16",
+    ncu_results: Optional[Dict[str, Dict]] = None,
+) -> List[Dict[str, Any]]:
+    """Ordered GPU execution rows with layer_id, semantic role, optional NCU."""
+    trace_path = Path(trace_path)
+    with open(trace_path, "r", encoding="utf-8") as f:
+        trace = json.load(f)
+
+    aten_ordered, aten_by_ext_id, launches_by_corr = _parse_trace_ordered(trace)
+    gpu_events = _iter_gpu_events_ordered(trace)
+    dtype_b = _dtype_bytes(precision)
+    ncu_results = ncu_results or {}
+
+    layer_starts = _compute_layer_boundaries(aten_ordered, num_layers)
+
+    rows: List[Dict[str, Any]] = []
+    for exec_index, ev in enumerate(gpu_events):
+        corr = ev.get("correlation")
+        launch = None
+        if corr is not None:
+            launch = launches_by_corr.get(int(corr))
+
+        ext = ev.get("external_id")
+        if ext is None and launch is not None:
+            ext = launch.get("external_id")
+
+        parent = _parent_aten(ev["ts"], ext, aten_by_ext_id, aten_ordered)
+        if parent is None:
+            layer_id = 0
+            aten_name = ""
+            input_dims: List = []
+            expert_type = "other"
+            structural_role = "other"
+            src_entry_id = None
+        else:
+            aten_name = parent.get("name", "")
+            input_dims = parent.get("input_dims", []) or []
+            layer_id = _layer_id_for_aten_index(
+                int(parent["aten_index"]), layer_starts, num_layers
+            )
+            cleaned = clean_kernel_name(ev["name"]) if ev["kind"] == "gpu_kernel" else ""
+            match = None
+            if ev["kind"] == "gpu_kernel" and cleaned:
+                match = _match_kernel_db_entry(cleaned, aten_name, input_dims, classified)
+            if match is not None:
+                expert_type = match.get("expert_type", "other")
+                structural_role = match.get("structural_role", "other")
+                src_entry_id = match.get("id")
+            else:
+                expert_type = "other"
+                structural_role = "other"
+                src_entry_id = None
+
+        semantic_role = _infer_semantic_role(
+            aten_name, expert_type, structural_role, input_dims
+        )
+        if ev["kind"] == "gpu_memcpy":
+            semantic_role = "copy / other"
+
+        hbm_fields = _compute_hbm_fields(aten_name, input_dims, dtype_b)
+        hbm_byte_data_from_ncu = False
+        hbm_bytes = float(hbm_fields["hbm_bytes"])
+        if src_entry_id and src_entry_id in ncu_results:
+            ncu = ncu_results[src_entry_id]
+            ncu_hbm = float(
+                (ncu.get("hbm_read_bytes") or 0) + (ncu.get("hbm_write_bytes") or 0)
+            )
+            if ncu_hbm > 0:
+                hbm_bytes = ncu_hbm
+                hbm_byte_data_from_ncu = True
+
+        grid = ev.get("grid") if ev["kind"] == "gpu_kernel" else None
+        cta_count = 1
+        if grid:
+            for dim in grid:
+                cta_count *= int(dim) if dim else 1
+
+        is_shared = expert_type == "shared_expert" if parent is not None else False
+        shared_bytes = hbm_bytes if is_shared else 0.0
+
+        row = {
+            "exec_index": exec_index,
+            "kind": ev["kind"],
+            "layer_id": layer_id,
+            "semantic_role": semantic_role,
+            "aten_op": {
+                "name": aten_name,
+                "input_dims": input_dims,
+                "external_id": parent.get("external_id") if parent else None,
+                "aten_index": parent.get("aten_index") if parent else None,
+            },
+            "gpu_event": {
+                "name": ev["name"],
+                "cleaned_name": clean_kernel_name(ev["name"])
+                if ev["kind"] == "gpu_kernel"
+                else ev["name"],
+                "duration_us": float(ev["dur"]),
+                "stream": ev.get("stream"),
+                "device": ev.get("device"),
+                "correlation": int(corr) if corr is not None else None,
+            },
+            "cuda_launch": {
+                "name": launch.get("name") if launch else None,
+                "correlation": launch.get("correlation") if launch else None,
+                "duration_us": float(launch["dur"]) if launch else None,
+            } if launch else None,
+            "flops": float(hbm_fields["flops"]),
+            "hbm_bytes": hbm_bytes,
+            "HBM_byte_data_from_ncu": hbm_byte_data_from_ncu,
+            "weight_bytes": float(hbm_fields["weight_bytes"]),
+            "activation_bytes": float(hbm_fields["activation_bytes"]),
+            "kv_bytes": float(hbm_fields["kv_bytes"]),
+            "shared_expert_bytes": shared_bytes,
+            "cta_count": int(cta_count),
+            "is_shared_expert": bool(is_shared),
+            "expert_type": expert_type,
+            "structural_role": structural_role,
+            "source_kernel_db_entry_id": src_entry_id,
+        }
+        rows.append(row)
+    return rows
+
+
+def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
+    per_layer: Dict[int, Dict[str, Any]] = defaultdict(lambda: {
+        "kernel_rows": 0,
+        "memcpy_rows": 0,
+        "time_us": 0.0,
+        "hbm_bytes_ncu": 0.0,
+        "hbm_bytes_estimated": 0.0,
+        "by_role": Counter(),
+    })
+    per_role: Counter = Counter()
+    expert_hbm = defaultdict(float)
+    expert_time = defaultdict(float)
+
+    total_ncu = 0.0
+    total_est = 0.0
+
+    for r in rows:
+        lid = int(r["layer_id"])
+        pl = per_layer[lid]
+        if r["kind"] == "gpu_kernel":
+            pl["kernel_rows"] += 1
+        else:
+            pl["memcpy_rows"] += 1
+        du = float(r["gpu_event"]["duration_us"])
+        pl["time_us"] += du
+        hb = float(r["hbm_bytes"])
+        if r.get("HBM_byte_data_from_ncu"):
+            pl["hbm_bytes_ncu"] += hb
+            total_ncu += hb
+        else:
+            pl["hbm_bytes_estimated"] += hb
+            total_est += hb
+        role = r.get("semantic_role", "other")
+        pl["by_role"][role] += 1
+        per_role[role] += hb
+        et = r.get("expert_type", "other")
+        if et in ("shared_expert", "routed_expert", "gate"):
+            expert_hbm[et] += hb
+            expert_time[et] += du
+
+    layer_list = []
+    for L in range(num_layers):
+        d = dict(per_layer[L])
+        d["layer_id"] = L
+        d["by_role"] = dict(d["by_role"])
+        layer_list.append(d)
+
+    return {
+        "per_layer": layer_list,
+        "per_semantic_role": dict(per_role),
+        "expert_totals": {
+            k: {"hbm_bytes": round(v, 2), "time_us": round(expert_time[k], 2)}
+            for k, v in expert_hbm.items()
+        },
+        "hbm_breakdown": {
+            "from_ncu_sum": round(total_ncu, 2),
+            "estimated_sum": round(total_est, 2),
+            "combined_sum": round(total_ncu + total_est, 2),
+        },
+    }
+
 
 def generate_op_profile(
+    trace_path: Path,
     classified_kernels: List[Dict],
     num_layers: int,
     precision: str = "bfloat16",
     ncu_results: Optional[Dict[str, Dict]] = None,
     output_path: Optional[Path] = None,
+    execution_trace_path: Optional[Path] = None,
     moe_debug_log_path: Optional[Union[str, Path]] = None,
-) -> List[Dict]:
-    """Generate per-layer per-op records for all kernels.
-
-    Each kernel DB entry that fires an integer multiple of num_layers times
-    is expanded into num_layers records (layer_id = 0 … num_layers-1).
-    Entries with frequencies that are not divisible by num_layers, or that
-    belong to the routed_expert type, get a single record with layer_id = -1.
-
-    Shared expert kernels are flagged with is_shared_expert=True and
-    shared_expert_bytes populated.
-
-    Args:
-        classified_kernels: Entries annotated with expert_type from
-            classify_kernel_entries().
-        num_layers: Number of transformer layers.
-        precision:  Data type precision string (e.g., "bfloat16").
-        ncu_results: Optional kernel_id -> NCU result dict; overrides
-            shape-estimated hbm_bytes with actual dram_read + dram_write.
-        output_path: If provided, writes op_profile.json to this path.
-        moe_debug_log_path: If set, append reconstruction debug lines here.
-            If None and output_path is set, defaults to ``op_profile.debug.txt``
-            in the same directory as ``op_profile.json``.
-
-    Returns:
-        List of record dicts, sorted by layer_id ASC (layer_id=-1 at end),
-        then by op_name.
-    """
+) -> Dict[str, Any]:
+    """Build execution_trace.json + aggregated op_profile.json from trace.json."""
     if output_path is not None and moe_debug_log_path is None:
         moe_debug_log_path = moe_op_profile_debug_path(output_path)
 
-    if not classified_kernels:
-        records: List[Dict] = []
-        if output_path is not None:
-            Path(output_path).write_text(json.dumps(records, indent=2))
-        return records
-
-    dtype_bytes = _dtype_bytes(precision)
-    ncu_results = ncu_results or {}
+    trace_path = Path(trace_path)
     num_layers = max(1, int(num_layers))
-
-    raw_records = []
-
-    for entry in classified_kernels:
-        expert_type = entry.get("expert_type", "other")
-        structural_role = entry.get("structural_role", "other")
-        aten_op = entry.get("aten_op", {})
-        aten_op_name = aten_op.get("name", "")
-        input_dims = aten_op.get("input_dims", [])
-        kernel = entry.get("kernel", {})
-        stats = entry.get("statistics", {})
-        entry_id = entry.get("id", "")
-
-        freq = int(stats.get("frequency", 1))
-        latency_us = float(stats.get("avg_duration_us", 0.0) or 0.0)
-
-        # CTA count from kernel grid dims.
-        grid = kernel.get("grid") or [1, 1, 1]
-        cta_count = 1
-        for dim in grid:
-            cta_count *= int(dim) if dim else 1
-
-        # Shape-based HBM field estimates.
-        hbm_fields = _compute_hbm_fields(aten_op_name, input_dims, dtype_bytes)
-
-        # NCU override: replace hbm_bytes with actual DRAM counters if available.
-        hbm_byte_data_from_ncu = False
-        if entry_id in ncu_results:
-            ncu = ncu_results[entry_id]
-            ncu_hbm = float(
-                (ncu.get("hbm_read_bytes") or 0) + (ncu.get("hbm_write_bytes") or 0)
-            )
-            if ncu_hbm > 0:
-                hbm_fields = dict(hbm_fields)
-                hbm_fields["hbm_bytes"] = ncu_hbm
-                hbm_byte_data_from_ncu = True
-
-        is_shared = expert_type == "shared_expert"
-
-        # Determine layer expansion: routed experts and non-divisible frequencies → layer_id=-1.
-        ops_count = _ops_per_layer(freq, num_layers) if expert_type != "routed_expert" else 0
-        is_layer_local = ops_count > 0
-
-        if is_layer_local:
-            for layer_id in range(num_layers):
-                for _ in range(ops_count):
-                    op_name_n = _infer_structural_op_name(aten_op_name, structural_role, input_dims)
-                    raw_records.append(_make_record(
-                        layer_id=layer_id,
-                        op_name=op_name_n,
-                        hbm_fields=hbm_fields,
-                        hbm_byte_data_from_ncu=hbm_byte_data_from_ncu,
-                        cta_count=cta_count,
-                        latency_us=latency_us,
-                        is_shared=is_shared,
-                        expert_type=expert_type,
-                        structural_role=structural_role,
-                        observed=True,
-                        reconstruction_source="trace",
-                        source_entry_id=entry_id,
-                    ))
-        else:
-            op_name = _infer_structural_op_name(aten_op_name, structural_role, input_dims)
-            raw_records.append(_make_record(
-                layer_id=-1,
-                op_name=op_name,
-                hbm_fields=hbm_fields,
-                hbm_byte_data_from_ncu=hbm_byte_data_from_ncu,
-                cta_count=cta_count,
-                latency_us=latency_us,
-                is_shared=is_shared,
-                expert_type=expert_type,
-                structural_role=structural_role,
-                observed=True,
-                reconstruction_source="trace",
-                source_entry_id=entry_id,
-            ))
 
     append_moe_op_profile_debug(
         moe_debug_log_path,
-        "[moe.reconstruct] --- shared expert template reconstruction ---",
-    )
-    records = _reconstruct_shared_expert_template(
-        raw_records, num_layers, moe_debug_log_path=moe_debug_log_path
+        f"[moe.op_profile] trace-centric build trace={trace_path} num_layers={num_layers}",
     )
 
-    # Sort: layer_id ASC with -1 at the end, then op_name for stability.
-    records.sort(key=lambda r: (
-        r["layer_id"] if r["layer_id"] >= 0 else 10 ** 9,
-        r["op_name"],
-    ))
+    rows = build_execution_trace(
+        trace_path=trace_path,
+        classified=classified_kernels,
+        num_layers=num_layers,
+        precision=precision,
+        ncu_results=ncu_results,
+    )
+
+    if execution_trace_path is None and output_path is not None:
+        execution_trace_path = Path(output_path).parent / "execution_trace.json"
+
+    if execution_trace_path is not None:
+        et_path = Path(execution_trace_path)
+        et_path.parent.mkdir(parents=True, exist_ok=True)
+        et_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+
+    aggregates = _aggregate(rows, num_layers)
+
+    profile = {
+        "schema_version": 2,
+        "source_trace": str(trace_path.resolve()),
+        "execution_trace_file": str(Path(execution_trace_path).resolve())
+        if execution_trace_path else None,
+        "num_layers": num_layers,
+        "row_count": len(rows),
+        "aggregates": aggregates,
+    }
 
     if output_path is not None:
-        Path(output_path).write_text(json.dumps(records, indent=2))
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(
+            json.dumps(profile, indent=2),
+            encoding="utf-8",
+        )
 
-    return records
+    return profile
+
+
+# Back-compat alias for pipeline tests / old imports

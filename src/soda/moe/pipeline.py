@@ -22,14 +22,14 @@ from soda.moe.detect import (
     moe_op_profile_debug_path,
     sample_routed_entries,
 )
-from soda.moe.op_profile import _detect_num_layers, generate_op_profile
+from soda.moe.op_profile import detect_num_layers_from_shared_patterns, generate_op_profile
 from soda.moe.report import generate_moe_report
 
 _NCU_SAMPLE_SIZE = 10  # Max entries to NCU-profile per expert type
 
 
 class MoEProfilePipeline:
-    """MoE memory profiling pipeline (NCU isolation + op_profile.json)."""
+    """MoE memory profiling: NCU isolation, trace-ordered execution_trace.json, aggregates in op_profile.json."""
 
     def __init__(self, kernel_db_path: Path, args) -> None:
         self.kernel_db_path = Path(kernel_db_path)
@@ -40,6 +40,8 @@ class MoEProfilePipeline:
             self.kernel_db = json.load(f)
 
         self.kernels: List[Dict] = self.kernel_db.get("kernels", [])
+
+        self.trace_path = self.kernel_db_path.parent / "trace.json"
 
         # Derive output directory alongside the kernel DB
         self.output_dir = self.kernel_db_path.parent / "moe_profile"
@@ -56,7 +58,14 @@ class MoEProfilePipeline:
     def run(self) -> Path:
         """Run the full pipeline and return the path to moe_profile.json."""
         print(f"\n[MoE Profile] Kernel DB: {self.kernel_db_path}")
+        print(f"[MoE Profile] Trace:      {self.trace_path}")
         print(f"[MoE Profile] Output:     {self.output_dir}")
+
+        if not self.trace_path.is_file():
+            raise FileNotFoundError(
+                f"MoE trace-centric profiling requires trace.json next to the kernel DB "
+                f"(expected {self.trace_path})"
+            )
 
         op_profile_path = self.output_dir / "op_profile.json"
         moe_debug_path = moe_op_profile_debug_path(op_profile_path)
@@ -96,23 +105,27 @@ class MoEProfilePipeline:
         )
         print(f"\n[MoE Profile] Report: {report_path}")
 
-        # 4. op_profile.json
+        # 4. execution_trace.json + aggregated op_profile.json (trace-ordered)
         num_layers = self._get_num_layers(classified)
         meta = self.kernel_db.get("metadata", {})
         cfg = meta.get("config", meta)
         precision = cfg.get("precision", "bfloat16") or "bfloat16"
-        records = generate_op_profile(
+        profile = generate_op_profile(
+            trace_path=self.trace_path,
             classified_kernels=classified,
             num_layers=num_layers,
             precision=precision,
             ncu_results=ncu_results,
             output_path=op_profile_path,
+            execution_trace_path=self.output_dir / "execution_trace.json",
             moe_debug_log_path=moe_debug_path,
         )
+        nrows = int(profile.get("row_count", 0))
         print(
-            f"[MoE Profile] Op profile ({len(records)} records, "
-            f"{num_layers} layers): {op_profile_path}"
+            f"[MoE Profile] Execution trace ({nrows} GPU rows, {num_layers} layers): "
+            f"{self.output_dir / 'execution_trace.json'}"
         )
+        print(f"[MoE Profile] Op profile (aggregates): {op_profile_path}")
         print(f"[MoE Profile] MoE debug log: {moe_debug_path}")
 
         return report_path
@@ -193,8 +206,8 @@ class MoEProfilePipeline:
             except Exception:
                 pass
 
-        # GCD-based fallback.
-        return _detect_num_layers(classified)
+        # GCD-based fallback on kernel DB shared-expert frequencies.
+        return detect_num_layers_from_shared_patterns(classified)
 
     @staticmethod
     def _print_classification_summary(classified: List[Dict]) -> None:
