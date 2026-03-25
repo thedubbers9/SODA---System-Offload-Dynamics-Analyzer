@@ -352,7 +352,7 @@ echo ""
 #     No model loading or GPU required to run this stage.
 #     Outputs (written to <exp_dir>/moe_profile/):
 #       op_profile.json    — per-kernel per-layer records with is_shared_expert flag
-#       moe_profile.json   — aggregate NCU isolation + optional NVBit reuse metrics
+#       moe_profile.json   — aggregate NCU isolation metrics per expert type
 # -----------------------------------------------------------------------------
 # soda-cli \
 #     --moe-profile \

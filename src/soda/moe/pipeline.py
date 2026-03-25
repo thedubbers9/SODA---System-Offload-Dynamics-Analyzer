@@ -1,28 +1,18 @@
 """MoE per-expert-type memory profiling pipeline.
 
-Two-pass design — passes are always separate invocations:
-
-  Pass 1 — NCU isolation (always):
-    ncu_profile_kernel() on sampled entries per expert type.
-    Provides absolute HBM bytes (hardware counters, accurate regardless
-    of cache context).  L1/L2 hit rates from NCU are isolation-only
-    (self-reuse) and are labelled as such.
-
-  Pass 2 — NVBit in-process (if --nvbit-lib provided):
-    Full model.generate() under LD_PRELOAD=mem_reuse_tracker.so.
-    Instruments kernels tagged by expert_type in execution order.
-    Provides in-context L1/L2 cache-line reuse and cross-expert data reuse.
+Pass — NCU isolation (when `ncu` is available):
+  ncu_profile_kernel() on sampled entries per expert type.
+  Provides absolute HBM bytes (hardware counters, accurate regardless
+  of cache context).  L1/L2 hit rates from NCU are isolation-only
+  (self-reuse) and are labelled as such.
 
 Usage::
 
     soda-cli --moe-profile --kernel-db-path <path>
-    soda-cli --moe-profile --kernel-db-path <path> --nvbit-lib <path>
 """
 from __future__ import annotations
 
 import json
-import os
-import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -39,7 +29,7 @@ _NCU_SAMPLE_SIZE = 10  # Max entries to NCU-profile per expert type
 
 
 class MoEProfilePipeline:
-    """MoE memory profiling pipeline (NCU isolation + optional NVBit in-process)."""
+    """MoE memory profiling pipeline (NCU isolation + op_profile.json)."""
 
     def __init__(self, kernel_db_path: Path, args) -> None:
         self.kernel_db_path = Path(kernel_db_path)
@@ -58,11 +48,6 @@ class MoEProfilePipeline:
         # Optional overrides
         self.shared_dim_override: Optional[int] = getattr(args, "moe_shared_dim", None)
         self.routed_dim_override: Optional[int] = getattr(args, "moe_routed_dim", None)
-        self.nvbit_lib: Optional[Path] = (
-            Path(getattr(args, "nvbit_lib", None))
-            if getattr(args, "nvbit_lib", None)
-            else None
-        )
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -91,7 +76,7 @@ class MoEProfilePipeline:
         )
         self._print_classification_summary(classified)
 
-        # 2. Pass 1 — NCU (isolation HBM baseline)
+        # 2. NCU isolation (HBM baseline)
         ncu_results: Dict[str, Dict] = {}
         try:
             from soda.ncu import ncu_check_available
@@ -102,36 +87,16 @@ class MoEProfilePipeline:
         except ImportError:
             print("[MoE Profile] soda.ncu not importable — skipping NCU pass")
 
-        # 3. Pass 2 — NVBit in-process (required if --nvbit-lib provided)
-        nvbit_results: Optional[Dict] = None
-        if self.nvbit_lib is not None:
-            if not self.nvbit_lib.exists():
-                print(
-                    f"[MoE Profile] Error: NVBit library not found: {self.nvbit_lib}",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1)
-            nvbit_results = self._run_nvbit_pass(classified)
-            if nvbit_results is None:
-                print(
-                    "[MoE Profile] Error: NVBit pass failed — see stderr above.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1)
-        else:
-            print("[MoE Profile] --nvbit-lib not provided — skipping NVBit pass")
-
-        # 4. Generate report
+        # 3. Aggregate report (NCU only)
         report_path = generate_moe_report(
             classified_kernels=classified,
             ncu_results=ncu_results,
-            nvbit_results=nvbit_results,
             output_dir=self.output_dir,
             args=self.args,
         )
         print(f"\n[MoE Profile] Report: {report_path}")
 
-        # 5. Generate op_profile.json
+        # 4. op_profile.json
         num_layers = self._get_num_layers(classified)
         meta = self.kernel_db.get("metadata", {})
         cfg = meta.get("config", meta)
@@ -153,7 +118,7 @@ class MoEProfilePipeline:
         return report_path
 
     # ------------------------------------------------------------------
-    # Pass 1: NCU isolation
+    # NCU isolation
     # ------------------------------------------------------------------
 
     def _run_ncu_pass(self, classified: List[Dict]) -> Dict[str, Dict]:
@@ -196,71 +161,6 @@ class MoEProfilePipeline:
                     results[kid] = result
 
         return results
-
-    # ------------------------------------------------------------------
-    # Pass 2: NVBit in-process inference
-    # ------------------------------------------------------------------
-
-    def _run_nvbit_pass(self, classified: List[Dict]) -> Optional[Dict]:
-        """Run full model inference under NVBit LD_PRELOAD.
-
-        Returns parsed NVBit reuse metrics dict, or None on failure.
-        """
-        from soda.moe.nvbit_profiler import build_expert_type_map, nvbit_profile_inference
-        from soda.moe.nvbit_parser import parse_reuse_log
-
-        # Build kernel_name -> expert_type map
-        expert_type_map = build_expert_type_map(classified)
-        if not expert_type_map:
-            print("[MoE Profile] NVBit: no tagged kernels — skipping")
-            return None
-
-        # Read model name and generation config from kernel DB metadata
-        meta = self.kernel_db.get("metadata", {})
-        cfg = meta.get("config", meta)
-        model_name = cfg.get("model_name") or cfg.get("model")
-        if not model_name:
-            print(
-                "[MoE Profile] NVBit: model_name not found in kernel DB metadata",
-                file=sys.stderr,
-            )
-            return None
-
-        generation_config = {
-            "batch_size": cfg.get("batch_size", 1),
-            "seq_len": cfg.get("seq_len", 128),
-            "max_new_tokens": cfg.get("max_new_tokens", 1),
-            "precision": cfg.get("precision", "bfloat16"),
-        }
-
-        output_log = self.output_dir / "nvbit_reuse.jsonl"
-        print(
-            f"[MoE Profile] NVBit: running inference under {self.nvbit_lib.name} "
-            f"({len(expert_type_map)} tagged kernels)"
-        )
-
-        success, log_path, msg = nvbit_profile_inference(
-            model_name=model_name,
-            generation_config=generation_config,
-            expert_type_map=expert_type_map,
-            nvbit_lib_path=self.nvbit_lib,
-            output_log=output_log,
-        )
-
-        if not success:
-            print(f"[MoE Profile] NVBit failed: {msg}", file=sys.stderr)
-            return None
-
-        nvbit_results = parse_reuse_log(log_path)
-        if nvbit_results is None:
-            print("[MoE Profile] NVBit log empty or unparseable", file=sys.stderr)
-            return None
-
-        print(
-            f"[MoE Profile] NVBit: parsed {nvbit_results.get('total_records', 0)} "
-            "kernel invocation records"
-        )
-        return nvbit_results
 
     # ------------------------------------------------------------------
     # Helpers

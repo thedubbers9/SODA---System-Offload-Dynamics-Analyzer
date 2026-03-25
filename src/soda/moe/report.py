@@ -1,8 +1,7 @@
 """MoE per-expert-type memory profiling report generator.
 
-Aggregates NCU isolation (absolute HBM bytes, L1/L2 self-reuse) and
-NVBit in-context (in-model-run L1/L2 cache state, cross-expert reuse)
-results into moe_profile.json.
+Aggregates NCU isolation (absolute HBM bytes, L1/L2 self-reuse) into
+moe_profile.json.
 
 No T_launch, HDBI, or overhead decomposition — memory metrics only.
 """
@@ -18,16 +17,14 @@ from typing import Dict, List, Optional
 def generate_moe_report(
     classified_kernels: List[Dict],
     ncu_results: Dict[str, Dict],
-    nvbit_results: Optional[Dict],
     output_dir: Path,
     args,
 ) -> Path:
-    """Generate moe_profile.json from NCU + NVBit results.
+    """Generate moe_profile.json from NCU isolation results.
 
     Args:
         classified_kernels: Entries annotated with expert_type from classify_kernel_entries().
         ncu_results: kernel_id -> NCU metric dict (from _run_ncu_pass).
-        nvbit_results: Parsed NVBit reuse log (from parse_reuse_log), or None.
         output_dir: Directory to write moe_profile.json.
         args: CLI args namespace (for moe_shared_dim, moe_routed_dim overrides).
 
@@ -36,17 +33,14 @@ def generate_moe_report(
     """
     output_dir = Path(output_dir)
 
-    # Build classification summary and per-expert ncu aggregates
     classification_summary = _build_classification_summary(classified_kernels)
     moe_config = _extract_moe_config(classified_kernels)
-    per_expert_type = _aggregate_per_expert(classified_kernels, ncu_results, nvbit_results)
-    data_reuse = _extract_data_reuse(nvbit_results)
+    per_expert_type = _aggregate_per_expert(classified_kernels, ncu_results)
 
     report = {
         "moe_config": moe_config,
         "classification_summary": classification_summary,
         "per_expert_type": per_expert_type,
-        "data_reuse": data_reuse,
     }
 
     output_path = output_dir / "moe_profile.json"
@@ -96,7 +90,6 @@ def _build_classification_summary(classified_kernels: List[Dict]) -> Dict:
 def _aggregate_per_expert(
     classified_kernels: List[Dict],
     ncu_results: Dict[str, Dict],
-    nvbit_results: Optional[Dict],
 ) -> Dict:
     """Build per-expert-type report section."""
     per_type: Dict[str, Dict] = {}
@@ -109,16 +102,9 @@ def _aggregate_per_expert(
 
         section: Dict = {}
 
-        # NCU isolation results for this expert type
         ncu_section = _aggregate_ncu_for_type(entries, ncu_results, et)
         if ncu_section:
             section["ncu_isolation"] = ncu_section
-
-        # NVBit in-context results for this expert type
-        if nvbit_results is not None:
-            nvbit_section = _extract_nvbit_for_type(nvbit_results, et)
-            if nvbit_section:
-                section["nvbit_in_context"] = nvbit_section
 
         if section:
             per_type[et] = section
@@ -132,7 +118,6 @@ def _aggregate_ncu_for_type(
     expert_type: str,
 ) -> Optional[Dict]:
     """Aggregate NCU metrics for all profiled entries of one expert type."""
-    # Collect NCU results that match this expert type
     relevant = [
         v for v in ncu_results.values()
         if v.get("expert_type") == expert_type
@@ -150,7 +135,6 @@ def _aggregate_ncu_for_type(
     l2_hit = _avg("l2_hit_rate_pct")
     compute_util = _avg("compute_util_pct")
 
-    # HBM bandwidth (TB/s): bytes / duration_us * 1e-6
     bw_vals = []
     for r in relevant:
         dur_us = r.get("kernel_duration_us")
@@ -181,67 +165,6 @@ def _aggregate_ncu_for_type(
     return result
 
 
-def _extract_nvbit_for_type(nvbit_results: Dict, expert_type: str) -> Optional[Dict]:
-    """Extract NVBit in-context stats for one expert type."""
-    per_type = nvbit_results.get("per_expert_type", {})
-    stats = per_type.get(expert_type)
-    if not stats:
-        return None
-
-    result = {
-        "note": "in-context profiling — L1/L2 reflects actual model-run cache state",
-        "total_invocations": stats.get("total_invocations"),
-        "total_global_loads": stats.get("total_global_loads"),
-        "avg_global_loads_per_invocation": stats.get("avg_global_loads_per_invocation"),
-        "hbm_bytes_per_invocation": stats.get("avg_hbm_bytes_per_invocation"),
-        "total_cachelines_tracked": stats.get("total_cachelines_tracked"),
-    }
-    # Remove None values
-    return {k: v for k, v in result.items() if v is not None}
-
-
-# ---------------------------------------------------------------------------
-# Data reuse section
-# ---------------------------------------------------------------------------
-
-def _extract_data_reuse(nvbit_results: Optional[Dict]) -> Dict:
-    """Build the data_reuse section from NVBit cross-expert reuse metrics."""
-    if nvbit_results is None:
-        return {
-            "available": False,
-            "note": "NVBit pass not run — provide --nvbit-lib for in-context reuse analysis",
-        }
-
-    cross = nvbit_results.get("cross_expert_reuse", {})
-    result: Dict = {"available": True}
-
-    # Cross-expert: shared → routed
-    shared_to_routed = cross.get("shared_to_routed")
-    if shared_to_routed:
-        result["cross_expert_shared_to_routed"] = {
-            "reuse_fraction": shared_to_routed.get("reuse_fraction"),
-            "overlap_cachelines": shared_to_routed.get("overlap_cachelines"),
-            "method": shared_to_routed.get("method", "exact_set_intersection"),
-            "interpretation": shared_to_routed.get("note", ""),
-        }
-
-    # Within-type inter-layer reuse
-    within: Dict = {}
-    for key, stats in cross.items():
-        if key.endswith("_within_type"):
-            et = key.replace("_within_type", "")
-            within[et] = {
-                "reuse_fraction": stats.get("reuse_fraction"),
-                "overlap_cachelines": stats.get("overlap_cachelines"),
-                "method": stats.get("method", "exact_set_intersection"),
-                "interpretation": stats.get("note", ""),
-            }
-    if within:
-        result["within_type_inter_layer_reuse"] = within
-
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Console summary
 # ---------------------------------------------------------------------------
@@ -253,7 +176,6 @@ def _print_console_summary(report: Dict) -> None:
     print("MoE Memory Profile Summary")
     print("=" * 60)
 
-    # Config
     print(f"\nDetection method : {cfg.get('detection_method', '?')}")
     if cfg.get("num_experts"):
         print(f"Num experts      : {cfg['num_experts']}")
@@ -264,12 +186,10 @@ def _print_console_summary(report: Dict) -> None:
     if cfg.get("hidden_dim"):
         print(f"Hidden dim       : {cfg['hidden_dim']}")
 
-    # Classification
     print("\nClassification:")
     for et, s in report.get("classification_summary", {}).items():
         print(f"  {et:<18} {s['entry_count']:>5} entries")
 
-    # Per-expert type metrics
     per_type = report.get("per_expert_type", {})
     if per_type:
         print("\nPer-Expert Memory Metrics:")
@@ -291,32 +211,5 @@ def _print_console_summary(report: Dict) -> None:
                     print(f"      L2 hit    : {ncu['avg_l2_hit_rate_pct']:.1f}% (isolation)")
                 if "avg_compute_util_pct" in ncu:
                     print(f"      Compute   : {ncu['avg_compute_util_pct']:.1f}%")
-
-            nvbit = section.get("nvbit_in_context", {})
-            if nvbit:
-                print(f"    NVBit in-context ({nvbit.get('total_invocations', '?')} invocations):")
-                if "hbm_bytes_per_invocation" in nvbit:
-                    hbm_mb = nvbit["hbm_bytes_per_invocation"] / 1e6
-                    print(f"      HBM/invoc : {hbm_mb:.2f} MB")
-                if "avg_global_loads_per_invocation" in nvbit:
-                    print(f"      GL/invoc  : {nvbit['avg_global_loads_per_invocation']:.0f}")
-
-    # Data reuse
-    dr = report.get("data_reuse", {})
-    if dr.get("available"):
-        print("\nData Reuse (NVBit in-context):")
-        s2r = dr.get("cross_expert_shared_to_routed")
-        if s2r:
-            pct = (s2r.get("reuse_fraction") or 0) * 100
-            print(f"  Shared→Routed L2 reuse : {pct:.1f}%")
-            if s2r.get("interpretation"):
-                print(f"    {s2r['interpretation']}")
-        within = dr.get("within_type_inter_layer_reuse", {})
-        for et, stats in within.items():
-            pct = (stats.get("reuse_fraction") or 0) * 100
-            print(f"  {et} inter-layer : {pct:.1f}%")
-    else:
-        if dr.get("note"):
-            print(f"\nData Reuse: {dr['note']}")
 
     print()

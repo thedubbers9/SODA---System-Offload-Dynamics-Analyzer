@@ -871,17 +871,7 @@ def get_args_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Run MoE per-expert-type memory profiling. Requires --kernel-db-path. "
-             "Reports NCU isolation HBM bytes and (optionally) NVBit in-context "
-             "L1/L2 cache reuse metrics. No model loading required.",
-    )
-    parser.add_argument(
-        "--nvbit-lib",
-        dest="nvbit_lib",
-        type=str,
-        default=None,
-        help="Path to compiled NVBit mem_reuse_tracker.so. If provided, runs a "
-             "second pass under LD_PRELOAD to measure in-context L1/L2 cache reuse "
-             "and cross-expert data reuse during actual model.generate().",
+             "Reports NCU isolation HBM bytes when ncu is available. No model loading required.",
     )
     parser.add_argument(
         "--moe-shared-dim",

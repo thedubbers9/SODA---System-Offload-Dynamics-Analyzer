@@ -2,7 +2,8 @@
 # =============================================================================
 # SODA SBATCH Template: MoE Shared-Expert Pipeline (Stage 1 + Stage 3)
 # =============================================================================
-# Commit-safe, reusable SLURM script for MoE profiling with optional NVBit pass.
+# Commit-safe, reusable SLURM script for MoE profiling (NCU isolation when
+# available, plus op_profile.json).
 #
 # This template intentionally does NOT embed HF tokens or read token files.
 # For gated models, authenticate before submit:
@@ -56,17 +57,6 @@ OUTPUT_TAG="moe-shared-expert"
 
 # Optional HuggingFace cache location
 HF_HOME="${HF_HOME:-/scratch/$USER/hf_cache}"
-
-# NVBit settings
-# Existing .so path for Stage 3 --nvbit-lib
-NVBIT_LIB_PATH="${NVBIT_LIB_PATH:-$SODA_PROJECT_ROOT/src/soda/moe/nvbit_tool/mem_reuse_tracker.so}"
-
-# Set to 1 to auto-build mem_reuse_tracker.so if missing
-AUTO_BUILD_NVBIT=0
-
-# Optional external NVBit SDK root (the extracted nvbit_release_x86_64 dir)
-# If empty, build uses bundled SDK in src/soda/moe/nvbit_tool/nvbit_release_x86_64
-NVBIT_SDK_PATH=""
 
 # =============================================================================
 # ENVIRONMENT SETUP — Usually no changes needed below
@@ -130,26 +120,6 @@ OUTPUT_ROOT="$(soda_make_output_root "$OUTPUT_TAG")"
 mkdir -p "$OUTPUT_ROOT"
 echo "Output root: $OUTPUT_ROOT"
 
-if [ ! -f "$NVBIT_LIB_PATH" ] && [ "$AUTO_BUILD_NVBIT" -eq 1 ]; then
-	echo "NVBit library not found at $NVBIT_LIB_PATH; attempting build..."
-	pushd "$SODA_ROOT/src/soda/moe/nvbit_tool" >/dev/null
-	if [ -n "$NVBIT_SDK_PATH" ]; then
-		make clean
-		make ARCH=all NVBIT_SDK_PATH="$NVBIT_SDK_PATH"
-	else
-		make clean
-		make ARCH=all
-	fi
-	popd >/dev/null
-fi
-
-if [ ! -f "$NVBIT_LIB_PATH" ]; then
-	echo "Error: NVBit library not found at $NVBIT_LIB_PATH"
-	echo "Build manually: cd src/soda/moe/nvbit_tool && make ARCH=all"
-	echo "Or set AUTO_BUILD_NVBIT=1 and optionally NVBIT_SDK_PATH."
-	exit 1
-fi
-
 # =============================================================================
 # Stage 1: Profiled inference + kernel DB
 # =============================================================================
@@ -179,18 +149,17 @@ fi
 echo "Experiment dir: $EXP_DIR"
 
 # =============================================================================
-# Stage 3: MoE profiling + NVBit in-context pass
+# Stage 3: MoE profiling (op_profile.json + optional NCU aggregates)
 # =============================================================================
 
 echo ""
 echo "============================================"
-echo "Stage 3: MoE Op Profile + NVBit"
+echo "Stage 3: MoE Op Profile"
 echo "============================================"
 
 soda-cli \
 	--moe-profile \
 	--kernel-db-path "$EXP_DIR/kernel_database.json" \
-	--nvbit-lib "$NVBIT_LIB_PATH" \
 	2>&1 | tee "$OUTPUT_ROOT/stage3.log"
 
 echo ""

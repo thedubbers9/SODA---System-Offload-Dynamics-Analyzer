@@ -13,7 +13,7 @@ SODA implements the **TaxBreak methodology** for decomposing host-side overhead 
 
 **Stage 2 (TaxBreak)** — HDBI decomposed into FT_python + FT_dispatch + δCT + KT with `i_lib` gating; per-kernel isolation-replay launch tax (raw + floor-adjusted); ATen translation tax; GPU roofline (with `--ncu`).
 
-**Stage 3 (MoE)** — per-kernel per-layer op profile with `is_shared_expert` flag; NCU isolation HBM bytes per expert type; optional NVBit in-context cache reuse.
+**Stage 3 (MoE)** — per-kernel per-layer op profile with `is_shared_expert` flag; NCU isolation HBM bytes per expert type when Nsight Compute is available.
 
 ## Output Files
 
@@ -29,7 +29,7 @@ Experiment directory: `<output-dir>/<model>_<precision>_bs<B>_sl<S>_mt<T>/`
 | `taxbreak/enhanced_taxbreak.json` | Stage 2 | Per-kernel isolation-replay breakdown |
 | `taxbreak/roofline.png` | Stage 2 + `--ncu` | GPU roofline plot |
 | `moe_profile/op_profile.json` | Stage 3 | Per-kernel per-layer records with `is_shared_expert` |
-| `moe_profile/moe_profile.json` | Stage 3 | NCU isolation + NVBit reuse metrics per expert type |
+| `moe_profile/moe_profile.json` | Stage 3 | NCU isolation aggregates per expert type (empty if ncu unavailable) |
 
 ## Installation
 
@@ -41,37 +41,6 @@ git clone https://github.com/prabsy96/soda.git
 cd SODA---System-Offload-Dynamics-Analyzer
 pip install -e .
 ```
-
-### Optional: NVBit Tool Build (for MoE in-context cache reuse)
-
-The NVBit pass is optional and only used when running MoE profiling with `--nvbit-lib`.
-
-```bash
-# From repo root
-cd src/soda/moe/nvbit_tool
-
-# Uses bundled NVBit SDK by default
-make ARCH=all
-
-# Output shared library used by --nvbit-lib
-ls -lh mem_reuse_tracker.so
-```
-
-Build from downloaded NVBit SDK tarball (`nvbit-Linux-x86_64-1.7.7.3.tar.bz2`):
-
-```bash
-tar -xjf nvbit-Linux-x86_64-1.7.7.3.tar.bz2
-# Produces: nvbit_release_x86_64/
-
-cd src/soda/moe/nvbit_tool
-make clean
-make ARCH=all NVBIT_SDK_PATH=/path/to/nvbit_release_x86_64
-```
-
-Notes:
-
-- `NVBIT_SDK_PATH` must point to the extracted `nvbit_release_x86_64` root (the Makefile internally uses `<root>/core`).
-- If `NVBIT_SDK_PATH` is not set, the Makefile falls back to the repo-bundled SDK at `src/soda/moe/nvbit_tool/nvbit_release_x86_64/core`.
 
 ## Quick Start
 
@@ -120,7 +89,6 @@ soda-cli --model gpt2 --output-dir output/ --seq-len 512 --batch-size 1 --num-gp
 | `--moe-shared-dim` | auto | Shared expert intermediate dimension override |
 | `--moe-routed-dim` | auto | Routed expert intermediate dimension override |
 | `--moe-num-layers` | auto | Number of transformer layers override |
-| `--nvbit-lib` | — | Path to `mem_reuse_tracker.so` for NVBit in-context pass |
 
 ## Pipelines
 
@@ -165,7 +133,7 @@ cp slurm/sbatch_template.sh slurm/my_job.sh
 sbatch slurm/my_job.sh
 ```
 
-For the NVBit MoE shared-expert pipeline example, use the dedicated template:
+For a SLURM example that runs Stage 1 plus MoE profiling, use:
 
 ```bash
 cp slurm/sbatch_moe_shared_expert_template.sh slurm/my_moe_job.sh
@@ -197,7 +165,7 @@ src/soda/
 ├── moe/              # MoE per-expert profiling (Stage 3)
 │   ├── detect.py     # Expert type classification
 │   ├── op_profile.py # op_profile.json with is_shared_expert flag
-│   ├── pipeline.py   # Orchestrator (NCU + optional NVBit)
+│   ├── pipeline.py   # Orchestrator (NCU + op_profile.json)
 │   └── report.py     # moe_profile.json
 ├── common/           # Utilities, trace parsing, CLI args
 ├── ncu.py            # NVIDIA Compute Profiler integration
@@ -224,36 +192,3 @@ PYTHONPATH=src python -m pytest
   pages={49-61},
   doi={10.1109/ISPASS64960.2025.00015}}
 ```
-
-## NVBit MoE Shared-Expert Pipeline (Separate from SODA Flow)
-
-This is a separate workflow that should be run independently from standard SODA analysis and TaxBreak runs.
-
-```bash
-# 0) Required environment
-source env.sh
-
-# 1) Build NVBit tool once (if not already built)
-cd src/soda/moe/nvbit_tool
-make ARCH=all
-cd ../../../../
-
-# 2) Stage 1: build kernel DB from a profiled run
-soda-cli -m Qwen/Qwen1.5-MoE-A2.7B \
-  --output-dir output/ \
-  --seq-len 1024 --batch-size 1 --max-new-tokens 1 \
-  --precision bfloat16 \
-  --kernel-db
-
-# 3) Stage 3: MoE profile with NVBit shared library
-soda-cli --moe-profile \
-  --kernel-db-path output/Qwen_Qwen1.5-MoE-A2.7B_eager_bfloat16_bs1_sl1024_mt1/kernel_database.json \
-  --nvbit-lib src/soda/moe/nvbit_tool/mem_reuse_tracker.so
-```
-
-Outputs for this separate pipeline:
-
-- `moe_profile/op_profile.json` — per-kernel per-layer records with `is_shared_expert`
-- `moe_profile/moe_profile.json` — NCU isolation metrics + NVBit in-context reuse metrics
-
-If `--nvbit-lib` is omitted, MoE profiling still runs, but NVBit/data-reuse fields are not populated.
