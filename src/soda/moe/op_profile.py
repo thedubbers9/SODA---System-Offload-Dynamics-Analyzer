@@ -300,6 +300,7 @@ def _make_record(
     layer_id: int,
     op_name: str,
     hbm_fields: Dict,
+    hbm_byte_data_from_ncu: bool,
     cta_count: int,
     latency_us: float,
     is_shared: bool,
@@ -317,6 +318,7 @@ def _make_record(
         "op_name": op_name,
         "flops": hbm_fields["flops"],
         "hbm_bytes": hbm_fields["hbm_bytes"],
+        "HBM_byte_data_from_ncu": hbm_byte_data_from_ncu,
         "weight_bytes": hbm_fields["weight_bytes"],
         "activation_bytes": hbm_fields["activation_bytes"],
         "kv_bytes": hbm_fields["kv_bytes"],
@@ -342,6 +344,7 @@ def _record_signature(r: Dict) -> Tuple:
         float(r.get("activation_bytes", 0.0)),
         int(r.get("cta_count", 0)),
         round(float(r.get("latency_us", 0.0)), 6),
+        int(bool(r.get("HBM_byte_data_from_ncu", False))),
     )
 
 
@@ -583,6 +586,7 @@ def generate_op_profile(
         hbm_fields = _compute_hbm_fields(aten_op_name, input_dims, dtype_bytes)
 
         # NCU override: replace hbm_bytes with actual DRAM counters if available.
+        hbm_byte_data_from_ncu = False
         if entry_id in ncu_results:
             ncu = ncu_results[entry_id]
             ncu_hbm = float(
@@ -591,6 +595,7 @@ def generate_op_profile(
             if ncu_hbm > 0:
                 hbm_fields = dict(hbm_fields)
                 hbm_fields["hbm_bytes"] = ncu_hbm
+                hbm_byte_data_from_ncu = True
 
         is_shared = expert_type == "shared_expert"
 
@@ -606,6 +611,7 @@ def generate_op_profile(
                         layer_id=layer_id,
                         op_name=op_name_n,
                         hbm_fields=hbm_fields,
+                        hbm_byte_data_from_ncu=hbm_byte_data_from_ncu,
                         cta_count=cta_count,
                         latency_us=latency_us,
                         is_shared=is_shared,
@@ -621,6 +627,7 @@ def generate_op_profile(
                 layer_id=-1,
                 op_name=op_name,
                 hbm_fields=hbm_fields,
+                hbm_byte_data_from_ncu=hbm_byte_data_from_ncu,
                 cta_count=cta_count,
                 latency_us=latency_us,
                 is_shared=is_shared,
