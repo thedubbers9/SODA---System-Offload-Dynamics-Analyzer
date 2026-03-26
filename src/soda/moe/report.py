@@ -143,8 +143,15 @@ def _aggregate_ncu_for_type(
     if not relevant:
         return None
 
+    # We map measured bytes to *all* entries in a bucket, but report should only
+    # treat the representative entry as truly "profiled" (otherwise counts and
+    # averages get skewed by repeated identical measurements).
+    representatives = [v for v in relevant if v.get("is_representative")]
+    if not representatives:
+        representatives = relevant
+
     def _avg(key: str) -> Optional[float]:
-        vals = [r[key] for r in relevant if key in r and r[key] is not None]
+        vals = [r[key] for r in representatives if key in r and r[key] is not None]
         return round(statistics.mean(vals), 2) if vals else None
 
     hbm_read = _avg("hbm_read_bytes")
@@ -154,7 +161,7 @@ def _aggregate_ncu_for_type(
     compute_util = _avg("compute_util_pct")
 
     bw_vals = []
-    for r in relevant:
+    for r in representatives:
         dur_us = r.get("kernel_duration_us")
         hbm_r = r.get("hbm_read_bytes", 0) or 0
         hbm_w = r.get("hbm_write_bytes", 0) or 0
@@ -164,7 +171,7 @@ def _aggregate_ncu_for_type(
     avg_bw = round(statistics.mean(bw_vals), 4) if bw_vals else None
 
     result: Dict = {
-        "profiled_count": len(relevant),
+        "profiled_count": len(representatives),
         "note": "isolation replay — L1/L2 reflects self-reuse only; HBM is accurate",
     }
     if hbm_read is not None:

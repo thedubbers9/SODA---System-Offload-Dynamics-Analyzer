@@ -900,6 +900,32 @@ def get_args_parser() -> argparse.ArgumentParser:
              "expert entry frequencies.",
     )
 
+    # NCU isolation bucket sampler controls (importance + coverage based)
+    parser.add_argument(
+        "--moe-ncu-max-buckets",
+        dest="moe_ncu_max_buckets",
+        type=int,
+        default=25,
+        help="Maximum number of representative NCU buckets to profile "
+             "(MoE expert roles only).",
+    )
+    parser.add_argument(
+        "--moe-ncu-target-hbm-coverage",
+        dest="moe_ncu_target_hbm_coverage",
+        type=float,
+        default=0.85,
+        help="Target cumulative estimated HBM coverage for selected NCU buckets "
+             "(0.0 to 1.0).",
+    )
+    parser.add_argument(
+        "--moe-ncu-min-buckets-per-role",
+        dest="moe_ncu_min_buckets_per_role",
+        type=int,
+        default=1,
+        help="Minimum number of representative buckets to include per important "
+             "structural role (shared/routed expand/down and moe_gate).",
+    )
+
     return parser
 
 def parse_and_validate_args(args=None) -> argparse.Namespace:
