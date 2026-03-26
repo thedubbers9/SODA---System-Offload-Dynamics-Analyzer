@@ -297,6 +297,7 @@ def _parse_trace_ordered(trace: Dict[str, Any]) -> Tuple[
     Dict[int, Dict[str, Any]],
 ]:
     """Return (aten_ordered, aten_by_ext_id, launches_by_corr)."""
+    debug_print("parse_trace_ordered:start", "trace_events=", len(trace.get("traceEvents", [])))
     aten_ordered: List[Dict[str, Any]] = []
     aten_by_ext_id: Dict[int, Dict[str, Any]] = {}
     launches_by_corr: Dict[int, Dict[str, Any]] = {}
@@ -337,11 +338,26 @@ def _parse_trace_ordered(trace: Dict[str, Any]) -> Tuple[
                     "external_id": args.get("External id"),
                 }
 
+        if len(aten_ordered) % 50000 == 0 and len(aten_ordered) > 0:
+            debug_print(
+                "parse_trace_ordered:progress",
+                "aten=", len(aten_ordered),
+                "launches=", len(launches_by_corr),
+            )
+
+    debug_print(
+        "parse_trace_ordered:done",
+        "aten=", len(aten_ordered),
+        "aten_by_ext=", len(aten_by_ext_id),
+        "launches=", len(launches_by_corr),
+    )
+
     return aten_ordered, aten_by_ext_id, launches_by_corr
 
 
 def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
     """GPU kernels and memcpys in strict trace file order."""
+    debug_print("iter_gpu_events:start", "trace_events=", len(trace.get("traceEvents", [])))
     out: List[Dict[str, Any]] = []
     for event in trace.get("traceEvents", []):
         if event.get("ph") != "X":
@@ -376,6 +392,9 @@ def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "stream": args.get("stream"),
                 "device": args.get("device"),
             })
+            if len(out) % 50000 == 0 and len(out) > 0:
+                debug_print("iter_gpu_events:progress", "gpu_events=", len(out))
+            debug_print("iter_gpu_events:done", "gpu_events=", len(out))
     return out
 
 
@@ -454,7 +473,13 @@ def _compute_layer_boundaries(
     num_layers: int,
 ) -> List[int]:
     """Return aten_index where each layer starts (len == num_layers)."""
+    debug_print(
+        "compute_layer_boundaries:start",
+        "aten_count=", len(aten_ordered),
+        "num_layers=", num_layers,
+    )
     if num_layers <= 0:
+        debug_print("compute_layer_boundaries:invalid_num_layers", num_layers)
         return []
 
     anchor_indices = [
@@ -465,12 +490,26 @@ def _compute_layer_boundaries(
 
     if len(anchor_indices) >= num_layers and len(anchor_indices) % num_layers == 0:
         step = len(anchor_indices) // num_layers
-        return [anchor_indices[i * step] for i in range(num_layers)]
+        out = [anchor_indices[i * step] for i in range(num_layers)]
+        debug_print(
+            "compute_layer_boundaries:anchor_even",
+            "anchors=", len(anchor_indices),
+            "step=", step,
+            "starts=", out,
+        )
+        return out
 
     if len(anchor_indices) >= num_layers:
         step = max(1, len(anchor_indices) // num_layers)
-        return [anchor_indices[min(i * step, len(anchor_indices) - 1)]
-                for i in range(num_layers)]
+        out = [anchor_indices[min(i * step, len(anchor_indices) - 1)]
+               for i in range(num_layers)]
+        debug_print(
+            "compute_layer_boundaries:anchor_uneven",
+            "anchors=", len(anchor_indices),
+            "step=", step,
+            "starts=", out,
+        )
+        return out
 
     meaningful_idx = [
         int(op["aten_index"])
@@ -478,7 +517,13 @@ def _compute_layer_boundaries(
         if _filtered_meaningful(op["name"])
     ]
     if len(meaningful_idx) < num_layers:
-        return [0] + [1] * (num_layers - 1)
+        out = [0] + [1] * (num_layers - 1)
+        debug_print(
+            "compute_layer_boundaries:fallback_short_meaningful",
+            "meaningful=", len(meaningful_idx),
+            "starts=", out,
+        )
+        return out
 
     boundaries = []
     chunk = len(meaningful_idx) / num_layers
@@ -489,6 +534,11 @@ def _compute_layer_boundaries(
     for i in range(1, len(boundaries)):
         if boundaries[i] <= boundaries[i - 1]:
             boundaries[i] = boundaries[i - 1] + 1
+    debug_print(
+        "compute_layer_boundaries:fallback_chunked",
+        "meaningful=", len(meaningful_idx),
+        "starts=", boundaries,
+    )
     return boundaries
 
 
@@ -529,6 +579,7 @@ def _match_kernel_db_entry(
 
 def _build_classified_index(classified: List[Dict]) -> Dict[str, List[Dict]]:
     """Index classified entries by cleaned kernel name."""
+    debug_print("build_classified_index:start", "classified=", len(classified))
     by_cleaned: Dict[str, List[Dict]] = defaultdict(list)
     for entry in classified:
         raw = entry.get("kernel", {}).get("raw_name", "") or ""
@@ -540,6 +591,7 @@ def _build_classified_index(classified: List[Dict]) -> Dict[str, List[Dict]]:
             cleaned = clean_kernel_name(raw)
         if cleaned:
             by_cleaned[cleaned].append(entry)
+    debug_print("build_classified_index:done", "unique_cleaned=", len(by_cleaned))
     return dict(by_cleaned)
 
 
@@ -615,6 +667,7 @@ def _infer_semantic_role(
 
 def detect_num_layers_from_shared_patterns(classified: List[Dict]) -> int:
     """Fallback: GCD of shared-expert invocation counts from kernel DB (not ordering)."""
+    debug_print("detect_num_layers:start", "classified=", len(classified))
     shared_freqs = [
         int(e.get("statistics", {}).get("frequency", 0))
         for e in classified
@@ -622,11 +675,14 @@ def detect_num_layers_from_shared_patterns(classified: List[Dict]) -> int:
         and int(e.get("statistics", {}).get("frequency", 0) or 0) > 0
     ]
     if not shared_freqs:
+        debug_print("detect_num_layers:no_shared_freqs")
         return 1
     g = shared_freqs[0]
     for f in shared_freqs[1:]:
         g = math.gcd(g, f)
-    return max(1, g)
+    out = max(1, g)
+    debug_print("detect_num_layers:done", "shared_freqs=", len(shared_freqs), "gcd=", out)
+    return out
 
 
 def build_execution_trace(
@@ -645,7 +701,9 @@ def build_execution_trace(
     )
     trace_path = Path(trace_path)
     with open(trace_path, "r", encoding="utf-8") as f:
+        debug_print("build_execution_trace:loading_trace", trace_path)
         trace = json.load(f)
+    debug_print("build_execution_trace:trace_loaded")
 
     aten_ordered, aten_by_ext_id, launches_by_corr = _parse_trace_ordered(trace)
     gpu_events = _iter_gpu_events_ordered(trace)
@@ -687,10 +745,23 @@ def build_execution_trace(
         parent = None
         if ext is not None:
             parent = aten_by_ext_id.get(int(ext))
+            if parent is not None and exec_index % 10000 == 0:
+                debug_print(
+                    "build_execution_trace:parent_by_external_id",
+                    "exec_index=", exec_index,
+                    "external_id=", ext,
+                    "aten_index=", parent.get("aten_index"),
+                )
         if parent is None:
             gpu_ts = float(ev["ts"])
             # If timestamps go backwards (rare), fall back to bisect method.
             if last_gpu_ts is not None and gpu_ts < last_gpu_ts:
+                debug_print(
+                    "build_execution_trace:timestamp_regression",
+                    "exec_index=", exec_index,
+                    "gpu_ts=", gpu_ts,
+                    "last_gpu_ts=", last_gpu_ts,
+                )
                 parent = _parent_aten_fast(gpu_ts, aten_ordered, aten_ts, aten_end)
             else:
                 # Advance `aten_i` and add newly-started ops to active list.
@@ -700,6 +771,13 @@ def build_execution_trace(
                 # Drop ops that ended before this gpu_ts.
                 if active_aten:
                     active_aten = [idx for idx in active_aten if aten_end[idx] > gpu_ts]
+                if exec_index % 10000 == 0:
+                    debug_print(
+                        "build_execution_trace:active_aten_state",
+                        "exec_index=", exec_index,
+                        "aten_i=", aten_i,
+                        "active_count=", len(active_aten),
+                    )
                 # Choose the smallest-duration containing op (best parent heuristic).
                 best_idx = None
                 best_dur = None
@@ -723,6 +801,8 @@ def build_execution_trace(
             expert_type = "other"
             structural_role = "other"
             src_entry_id = None
+            if exec_index % 10000 == 0:
+                debug_print("build_execution_trace:no_parent", "exec_index=", exec_index, "gpu_name=", ev.get("name"))
         else:
             aten_name = parent.get("name", "")
             input_dims = parent.get("input_dims", []) or []
@@ -746,6 +826,16 @@ def build_execution_trace(
                 expert_type = "other"
                 structural_role = "other"
                 src_entry_id = None
+            if exec_index % 10000 == 0:
+                debug_print(
+                    "build_execution_trace:parent_attached",
+                    "exec_index=", exec_index,
+                    "aten=", aten_name,
+                    "layer_id=", layer_id,
+                    "expert_type=", expert_type,
+                    "structural_role=", structural_role,
+                    "matched_entry=", src_entry_id,
+                )
 
         semantic_role = _infer_semantic_role(
             aten_name, expert_type, structural_role, input_dims
@@ -764,6 +854,13 @@ def build_execution_trace(
             if ncu_hbm > 0:
                 hbm_bytes = ncu_hbm
                 hbm_byte_data_from_ncu = True
+                if exec_index % 10000 == 0:
+                    debug_print(
+                        "build_execution_trace:ncu_override",
+                        "exec_index=", exec_index,
+                        "src_entry_id=", src_entry_id,
+                        "ncu_hbm=", ncu_hbm,
+                    )
 
         grid = ev.get("grid") if ev["kind"] == "gpu_kernel" else None
         cta_count = 1
@@ -812,6 +909,12 @@ def build_execution_trace(
             "source_kernel_db_entry_id": src_entry_id,
         }
         rows[exec_index] = row
+    debug_print(
+        "build_execution_trace:summary",
+        "rows=", len(rows),
+        "kernels=", sum(1 for r in rows if r and r.get("kind") == "gpu_kernel"),
+        "memcpy=", sum(1 for r in rows if r and r.get("kind") == "gpu_memcpy"),
+    )
     debug_print("build_execution_trace:done", "rows=", len(rows))
     return rows
 
@@ -856,6 +959,13 @@ def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
         if et in ("shared_expert", "routed_expert", "gate"):
             expert_hbm[et] += hb
             expert_time[et] += du
+        if (pl["kernel_rows"] + pl["memcpy_rows"]) % 50000 == 0 and (pl["kernel_rows"] + pl["memcpy_rows"]) > 0:
+            debug_print(
+                "aggregate:layer_progress",
+                "layer=", lid,
+                "rows=", pl["kernel_rows"] + pl["memcpy_rows"],
+                "time_us=", pl["time_us"],
+            )
 
     layer_list = []
     for L in range(num_layers):
