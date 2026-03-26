@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from soda.common.data import clean_kernel_name
+from soda.moe.debug import debug_print
 from soda.moe.detect import append_moe_op_profile_debug, moe_op_profile_debug_path
 
 _GEMM_OPS = frozenset({
@@ -548,6 +549,12 @@ def build_execution_trace(
     ncu_results: Optional[Dict[str, Dict]] = None,
 ) -> List[Dict[str, Any]]:
     """Ordered GPU execution rows with layer_id, semantic role, optional NCU."""
+    debug_print(
+        "build_execution_trace:start",
+        "trace_path=", trace_path,
+        "classified_count=", len(classified),
+        "num_layers=", num_layers,
+    )
     trace_path = Path(trace_path)
     with open(trace_path, "r", encoding="utf-8") as f:
         trace = json.load(f)
@@ -556,11 +563,22 @@ def build_execution_trace(
     gpu_events = _iter_gpu_events_ordered(trace)
     dtype_b = _dtype_bytes(precision)
     ncu_results = ncu_results or {}
+    debug_print(
+        "trace_parse:counts",
+        "aten_ops=", len(aten_ordered),
+        "aten_by_ext=", len(aten_by_ext_id),
+        "launches=", len(launches_by_corr),
+        "gpu_events=", len(gpu_events),
+        "ncu_results=", len(ncu_results),
+    )
 
     layer_starts = _compute_layer_boundaries(aten_ordered, num_layers)
+    debug_print("layer_boundaries", layer_starts)
 
     rows: List[Dict[str, Any]] = []
     for exec_index, ev in enumerate(gpu_events):
+        if exec_index % 500 == 0:
+            debug_print("build_execution_trace:progress", "exec_index=", exec_index, "total=", len(gpu_events))
         corr = ev.get("correlation")
         launch = None
         if corr is not None:
@@ -664,10 +682,12 @@ def build_execution_trace(
             "source_kernel_db_entry_id": src_entry_id,
         }
         rows.append(row)
+    debug_print("build_execution_trace:done", "rows=", len(rows))
     return rows
 
 
 def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
+    debug_print("aggregate:start", "rows=", len(rows), "num_layers=", num_layers)
     per_layer: Dict[int, Dict[str, Any]] = defaultdict(lambda: {
         "kernel_rows": 0,
         "memcpy_rows": 0,
@@ -740,6 +760,14 @@ def generate_op_profile(
     moe_debug_log_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """Build execution_trace.json + aggregated op_profile.json from trace.json."""
+    debug_print(
+        "op_profile_gen:start",
+        "trace_path=", trace_path,
+        "num_layers=", num_layers,
+        "precision=", precision,
+        "classified_count=", len(classified_kernels),
+        "ncu_count=", len(ncu_results or {}),
+    )
     if output_path is not None and moe_debug_log_path is None:
         moe_debug_log_path = moe_op_profile_debug_path(output_path)
 
@@ -758,6 +786,7 @@ def generate_op_profile(
         precision=precision,
         ncu_results=ncu_results,
     )
+    debug_print("op_profile_gen:rows_built", len(rows))
 
     if execution_trace_path is None and output_path is not None:
         execution_trace_path = Path(output_path).parent / "execution_trace.json"
@@ -766,8 +795,10 @@ def generate_op_profile(
         et_path = Path(execution_trace_path)
         et_path.parent.mkdir(parents=True, exist_ok=True)
         et_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        debug_print("op_profile_gen:execution_trace_written", et_path)
 
     aggregates = _aggregate(rows, num_layers)
+    debug_print("op_profile_gen:aggregated", "keys=", list(aggregates.keys()))
 
     profile = {
         "schema_version": 2,
@@ -785,7 +816,9 @@ def generate_op_profile(
             json.dumps(profile, indent=2),
             encoding="utf-8",
         )
+        debug_print("op_profile_gen:profile_written", output_path)
 
+    debug_print("op_profile_gen:done", "row_count=", len(rows))
     return profile
 
 

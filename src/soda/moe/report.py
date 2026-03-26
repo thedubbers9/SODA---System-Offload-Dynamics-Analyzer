@@ -13,6 +13,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from soda.moe.debug import debug_print
+
 
 def generate_moe_report(
     classified_kernels: List[Dict],
@@ -32,10 +34,18 @@ def generate_moe_report(
         Path to the written moe_profile.json.
     """
     output_dir = Path(output_dir)
+    debug_print(
+        "report_gen:start",
+        "classified=", len(classified_kernels),
+        "ncu_results=", len(ncu_results),
+        "output_dir=", output_dir,
+    )
 
     classification_summary = _build_classification_summary(classified_kernels)
     moe_config = _extract_moe_config(classified_kernels)
     per_expert_type = _aggregate_per_expert(classified_kernels, ncu_results)
+    debug_print("report_gen:classification_summary_keys=", list(classification_summary.keys()))
+    debug_print("report_gen:per_expert_type_keys=", list(per_expert_type.keys()))
 
     report = {
         "moe_config": moe_config,
@@ -46,8 +56,10 @@ def generate_moe_report(
     output_path = output_dir / "moe_profile.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+    debug_print("report_gen:wrote", output_path)
 
     _print_console_summary(report)
+    debug_print("report_gen:done")
     return output_path
 
 
@@ -93,10 +105,12 @@ def _aggregate_per_expert(
 ) -> Dict:
     """Build per-expert-type report section."""
     per_type: Dict[str, Dict] = {}
+    debug_print("aggregate_per_expert:start")
 
     expert_types = ["shared_expert", "routed_expert", "gate", "attention"]
     for et in expert_types:
         entries = [e for e in classified_kernels if e.get("expert_type") == et]
+        debug_print("aggregate_per_expert:type", et, "entry_count=", len(entries))
         if not entries:
             continue
 
@@ -105,10 +119,12 @@ def _aggregate_per_expert(
         ncu_section = _aggregate_ncu_for_type(entries, ncu_results, et)
         if ncu_section:
             section["ncu_isolation"] = ncu_section
+        debug_print("aggregate_per_expert:type_ncu", et, "has_ncu_section=", bool(ncu_section))
 
         if section:
             per_type[et] = section
 
+    debug_print("aggregate_per_expert:done", "types=", list(per_type.keys()))
     return per_type
 
 
@@ -118,10 +134,12 @@ def _aggregate_ncu_for_type(
     expert_type: str,
 ) -> Optional[Dict]:
     """Aggregate NCU metrics for all profiled entries of one expert type."""
+    debug_print("aggregate_ncu:start", "expert_type=", expert_type, "ncu_total=", len(ncu_results))
     relevant = [
         v for v in ncu_results.values()
         if v.get("expert_type") == expert_type
     ]
+    debug_print("aggregate_ncu:relevant_count=", len(relevant))
     if not relevant:
         return None
 
@@ -162,6 +180,7 @@ def _aggregate_ncu_for_type(
     if compute_util is not None:
         result["avg_compute_util_pct"] = compute_util
 
+    debug_print("aggregate_ncu:done", "expert_type=", expert_type, "keys=", list(result.keys()))
     return result
 
 

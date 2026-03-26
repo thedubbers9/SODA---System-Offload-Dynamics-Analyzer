@@ -22,6 +22,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+from soda.moe.debug import debug_print
+
 # ATen op names that represent GEMM-type operations.
 GEMM_OPS: frozenset = frozenset({
     "aten::linear",
@@ -275,7 +277,14 @@ def detect_moe_config(
           hidden_dim (int|None), detection_method (str),
           cardinality_per_group (Dict[str, int])
     """
+    debug_print(
+        "detect_moe_config:start",
+        "kernel_count=", len(kernels),
+        "shared_override=", shared_dim_override,
+        "routed_override=", routed_dim_override,
+    )
     if shared_dim_override is not None and routed_dim_override is not None:
+        debug_print("detect_moe_config:override_mode")
         return {
             "num_experts": None,
             "shared_dim": shared_dim_override,
@@ -293,6 +302,7 @@ def detect_moe_config(
         weight_shape = _get_weight_shape(entry)
         if weight_shape and len(weight_shape) >= 1:
             groups[weight_shape].append(entry)
+    debug_print("detect_moe_config:group_count=", len(groups))
 
     if not groups:
         return {
@@ -348,6 +358,11 @@ def detect_moe_config(
         if g["n_unique_act"] >= CARDINALITY_THRESHOLD or g["cv"] > CV_THRESHOLD
     ]
     fixed_groups = [g for g in group_stats if g not in routed_groups]
+    debug_print(
+        "detect_moe_config:split",
+        "routed_groups=", len(routed_groups),
+        "fixed_groups=", len(fixed_groups),
+    )
 
     # Identify gate: smallest output_dim significantly below hidden (routing vector).
     # Exclude 3D groups (bmm attention heads) and scalar projections (output_dim <= 1).
@@ -384,7 +399,7 @@ def detect_moe_config(
         most_common = max(candidates, key=lambda g: len(g["entries"]))
         routed_dim = most_common["output_dim"]
 
-    return {
+    out = {
         "num_experts": gate_dim,
         "shared_dim": shared_dim,
         "routed_dim": routed_dim,
@@ -392,6 +407,14 @@ def detect_moe_config(
         "detection_method": "cardinality",
         "cardinality_per_group": cardinality_per_group,
     }
+    debug_print(
+        "detect_moe_config:done",
+        "hidden=", hidden_dim,
+        "shared=", shared_dim,
+        "routed=", routed_dim,
+        "num_experts=", gate_dim,
+    )
+    return out
 
 
 def classify_kernel_entries(
@@ -425,6 +448,11 @@ def classify_kernel_entries(
         ``structural_role`` (dim-exact match when possible, else expand/contract
         refinement for shared/routed), and ``model_dims``.
     """
+    debug_print(
+        "classify:start",
+        "kernel_count=", len(kernels),
+        "has_model_config=", model_config is not None,
+    )
     # Apply HuggingFace model_config if provided
     if model_config is not None:
         if shared_dim_override is None:
@@ -437,6 +465,7 @@ def classify_kernel_entries(
         shared_dim_override=shared_dim_override,
         routed_dim_override=routed_dim_override,
     )
+    debug_print("classify:config", config)
 
     shared_dim = config.get("shared_dim")
     routed_dim = config.get("routed_dim")
@@ -460,6 +489,7 @@ def classify_kernel_entries(
         weight_shape = _get_weight_shape(entry)
         if weight_shape is not None:
             groups[weight_shape].append(idx)
+    debug_print("classify:gemm_group_count=", len(groups))
 
     # Assign expert_type per weight shape group (broad / historical logic).
     group_type: Dict[Tuple[int, ...], str] = {}
@@ -543,6 +573,14 @@ def classify_kernel_entries(
         else:
             group_type[weight_shape] = "shared_expert"
 
+        debug_print(
+            "classify:group",
+            "weight_shape=", weight_shape,
+            "output_dim=", output_dim,
+            "input_dim=", input_dim,
+            "assigned=", group_type[weight_shape],
+        )
+
     # Refine structural_role from dims + expand/contract (does not change expert_type).
     group_structural_role: Dict[Tuple[int, ...], str] = {}
     for weight_shape, et in group_type.items():
@@ -589,6 +627,7 @@ def classify_kernel_entries(
         }
         result.append(annotated)
 
+    debug_print("classify:done", "annotated_count=", len(result))
     return result
 
 
