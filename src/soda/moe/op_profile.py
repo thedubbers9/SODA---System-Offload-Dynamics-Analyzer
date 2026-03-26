@@ -385,20 +385,68 @@ def _parent_aten(
     aten_by_ext_id: Dict[int, Dict[str, Any]],
     aten_ordered: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    if ext_hint is not None and int(ext_hint) in aten_by_ext_id:
-        return aten_by_ext_id[int(ext_hint)]
+    """Find the most likely parent ATen op for a GPU timestamp.
 
-    candidates = [
-        op for op in aten_ordered
-        if op["ts"] <= gpu_ts < op["ts"] + op["dur"]
-    ]
-    if candidates:
-        return min(candidates, key=lambda o: o["dur"])
-    prev = None
-    for op in aten_ordered:
-        if op["ts"] <= gpu_ts:
-            prev = op
-    return prev
+    This function is performance-critical: it can be called millions of times.
+    Prefer using the fast path in `build_execution_trace()` which passes in
+    precomputed `aten_ts` / `aten_end` arrays.
+    """
+    if ext_hint is not None:
+        rec = aten_by_ext_id.get(int(ext_hint))
+        if rec is not None:
+            return rec
+
+    # Fallback: build minimal arrays and do a bisect-based lookup.
+    # (Still far faster than scanning the entire list for each event.)
+    if not aten_ordered:
+        return None
+    aten_ts = [float(op.get("ts", 0) or 0) for op in aten_ordered]
+    aten_end = [float(op.get("ts", 0) or 0) + float(op.get("dur", 0) or 0) for op in aten_ordered]
+    return _parent_aten_fast(gpu_ts, aten_ordered, aten_ts, aten_end)
+
+
+def _parent_aten_fast(
+    gpu_ts: float,
+    aten_ordered: List[Dict[str, Any]],
+    aten_ts: List[float],
+    aten_end: List[float],
+    *,
+    backward_scan_limit: int = 256,
+) -> Optional[Dict[str, Any]]:
+    """Bisect + bounded backward scan for containing ATen interval.
+
+    Trace events are in file order, and `aten_ordered` is appended in that same
+    order, so `aten_ts` is monotonic non-decreasing in practice.
+    """
+    if not aten_ordered:
+        return None
+
+    i = bisect.bisect_right(aten_ts, gpu_ts) - 1
+    if i < 0:
+        return None
+
+    best_idx = None
+    best_dur = None
+
+    # Scan backwards to find the smallest-duration ATen op that *contains* gpu_ts.
+    # Overlap depth is typically small; bounding keeps worst-case predictable.
+    steps = 0
+    j = i
+    while j >= 0 and steps < backward_scan_limit:
+        if aten_ts[j] <= gpu_ts < aten_end[j]:
+            dur = aten_end[j] - aten_ts[j]
+            if best_dur is None or dur < best_dur:
+                best_dur = dur
+                best_idx = j
+        # Once the op ends before gpu_ts, earlier ops may still contain it if
+        # their duration is larger, so we can't break solely on aten_end[j].
+        j -= 1
+        steps += 1
+
+    if best_idx is not None:
+        return aten_ordered[best_idx]
+    # Fallback: closest preceding ATen op.
+    return aten_ordered[i]
 
 
 def _compute_layer_boundaries(
@@ -468,6 +516,46 @@ def _match_kernel_db_entry(
         eclean = entry.get("kernel", {}).get("name", "") or ""
         if clean_kernel_name(raw) != cleaned_kernel and eclean != cleaned_kernel:
             continue
+        opn = entry.get("aten_op", {}).get("name", "")
+        score = 2 if opn == aten_name else 1
+        dims = entry.get("aten_op", {}).get("input_dims", [])
+        if dims and input_dims and dims == input_dims:
+            score += 2
+        if score > best_score:
+            best_score = score
+            best = entry
+    return best
+
+
+def _build_classified_index(classified: List[Dict]) -> Dict[str, List[Dict]]:
+    """Index classified entries by cleaned kernel name."""
+    by_cleaned: Dict[str, List[Dict]] = defaultdict(list)
+    for entry in classified:
+        raw = entry.get("kernel", {}).get("raw_name", "") or ""
+        eclean = entry.get("kernel", {}).get("name", "") or ""
+        cleaned = ""
+        if eclean:
+            cleaned = eclean
+        elif raw:
+            cleaned = clean_kernel_name(raw)
+        if cleaned:
+            by_cleaned[cleaned].append(entry)
+    return dict(by_cleaned)
+
+
+def _match_kernel_db_entry_indexed(
+    cleaned_kernel: str,
+    aten_name: str,
+    input_dims: List,
+    *,
+    candidates_by_cleaned: Dict[str, List[Dict]],
+) -> Optional[Dict]:
+    candidates = candidates_by_cleaned.get(cleaned_kernel)
+    if not candidates:
+        return None
+    best = None
+    best_score = -1
+    for entry in candidates:
         opn = entry.get("aten_op", {}).get("name", "")
         score = 2 if opn == aten_name else 1
         dims = entry.get("aten_op", {}).get("input_dims", [])
@@ -563,6 +651,9 @@ def build_execution_trace(
     gpu_events = _iter_gpu_events_ordered(trace)
     dtype_b = _dtype_bytes(precision)
     ncu_results = ncu_results or {}
+    candidates_by_cleaned = _build_classified_index(classified)
+    aten_ts = [float(op.get("ts", 0) or 0) for op in aten_ordered]
+    aten_end = [float(op.get("ts", 0) or 0) + float(op.get("dur", 0) or 0) for op in aten_ordered]
     debug_print(
         "trace_parse:counts",
         "aten_ops=", len(aten_ordered),
@@ -575,7 +666,12 @@ def build_execution_trace(
     layer_starts = _compute_layer_boundaries(aten_ordered, num_layers)
     debug_print("layer_boundaries", layer_starts)
 
-    rows: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = [None] * len(gpu_events)  # type: ignore[list-item]
+    # Streaming parent-ATen attach: assumes GPU timestamps are usually non-decreasing.
+    # Keeps a small active set of ATen ops that overlap the current GPU event.
+    aten_i = 0
+    active_aten: List[int] = []
+    last_gpu_ts: Optional[float] = None
     for exec_index, ev in enumerate(gpu_events):
         if exec_index % 500 == 0:
             debug_print("build_execution_trace:progress", "exec_index=", exec_index, "total=", len(gpu_events))
@@ -588,7 +684,38 @@ def build_execution_trace(
         if ext is None and launch is not None:
             ext = launch.get("external_id")
 
-        parent = _parent_aten(ev["ts"], ext, aten_by_ext_id, aten_ordered)
+        parent = None
+        if ext is not None:
+            parent = aten_by_ext_id.get(int(ext))
+        if parent is None:
+            gpu_ts = float(ev["ts"])
+            # If timestamps go backwards (rare), fall back to bisect method.
+            if last_gpu_ts is not None and gpu_ts < last_gpu_ts:
+                parent = _parent_aten_fast(gpu_ts, aten_ordered, aten_ts, aten_end)
+            else:
+                # Advance `aten_i` and add newly-started ops to active list.
+                while aten_i < len(aten_ordered) and aten_ts[aten_i] <= gpu_ts:
+                    active_aten.append(aten_i)
+                    aten_i += 1
+                # Drop ops that ended before this gpu_ts.
+                if active_aten:
+                    active_aten = [idx for idx in active_aten if aten_end[idx] > gpu_ts]
+                # Choose the smallest-duration containing op (best parent heuristic).
+                best_idx = None
+                best_dur = None
+                for idx in active_aten:
+                    if aten_ts[idx] <= gpu_ts < aten_end[idx]:
+                        dur = aten_end[idx] - aten_ts[idx]
+                        if best_dur is None or dur < best_dur:
+                            best_dur = dur
+                            best_idx = idx
+                if best_idx is not None:
+                    parent = aten_ordered[best_idx]
+                elif active_aten:
+                    parent = aten_ordered[active_aten[-1]]
+                else:
+                    parent = None
+            last_gpu_ts = gpu_ts
         if parent is None:
             layer_id = 0
             aten_name = ""
@@ -605,7 +732,12 @@ def build_execution_trace(
             cleaned = clean_kernel_name(ev["name"]) if ev["kind"] == "gpu_kernel" else ""
             match = None
             if ev["kind"] == "gpu_kernel" and cleaned:
-                match = _match_kernel_db_entry(cleaned, aten_name, input_dims, classified)
+                match = _match_kernel_db_entry_indexed(
+                    cleaned,
+                    aten_name,
+                    input_dims,
+                    candidates_by_cleaned=candidates_by_cleaned,
+                )
             if match is not None:
                 expert_type = match.get("expert_type", "other")
                 structural_role = match.get("structural_role", "other")
@@ -655,9 +787,7 @@ def build_execution_trace(
             },
             "gpu_event": {
                 "name": ev["name"],
-                "cleaned_name": clean_kernel_name(ev["name"])
-                if ev["kind"] == "gpu_kernel"
-                else ev["name"],
+                "cleaned_name": cleaned if ev["kind"] == "gpu_kernel" else ev["name"],
                 "duration_us": float(ev["dur"]),
                 "stream": ev.get("stream"),
                 "device": ev.get("device"),
@@ -681,7 +811,7 @@ def build_execution_trace(
             "structural_role": structural_role,
             "source_kernel_db_entry_id": src_entry_id,
         }
-        rows.append(row)
+        rows[exec_index] = row
     debug_print("build_execution_trace:done", "rows=", len(rows))
     return rows
 
