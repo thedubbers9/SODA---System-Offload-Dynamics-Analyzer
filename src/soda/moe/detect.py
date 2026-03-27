@@ -1,18 +1,19 @@
-"""Expert type classification from the SODA kernel database.
+"""MoE GEMM-family classification from the SODA kernel database.
 
-Classifies each kernel DB entry into one of:
-  "shared_expert"  — fixed full-batch GEMM (always activated, large intermediate)
-  "routed_expert"  — variable-batch GEMM (token-routing, many unique activation shapes)
-  "gate"           — small routing linear (weight[0] == num_experts)
-  "attention"      — attention projection (3D input or square weight)
-  "other"          — anything else
+This module intentionally classifies **only GEMM-family ops** using kernel-DB
+shape/cardinality signals. It does **not** attempt to provide a complete
+trace-level structural labeling system.
 
-Primary detection signal: entry cardinality per weight shape.
+Outputs:
+- ``expert_type``: coarse GEMM family bucket (shared_expert / routed_expert / gate
+  / attention / unknown_gemm / non_gemm)
+- ``gemm_structural_role``: MoE projection role for GEMM-family ops only
+  (shared_expert_expand/down, routed_expert_expand/down, moe_gate, attention,
+   unknown_gemm). For non-GEMM ops: ``non_gemm``.
+- ``model_dims``: detected MoE dimension metadata (hidden/shared/routed/num_experts)
 
-The kernel identity key includes input_dims, so each unique activation shape
-(token count N) creates its own DB entry.  Routed experts have high cardinality
-(variable N -> many entries per weight shape) while shared/gate/attention have
-low cardinality (fixed activation shape -> 1-3 entries per weight shape).
+Trace-level structural roles (moe_intermediate / routing_metadata / etc.) are
+assigned later from the ordered execution trace.
 """
 from __future__ import annotations
 
@@ -424,7 +425,7 @@ def classify_kernel_entries(
     routed_dim_override: Optional[int] = None,
     moe_debug_log_path: Optional[Union[str, Path]] = None,
 ) -> List[Dict]:
-    """Annotate each kernel DB entry with an expert_type field.
+    """Annotate each kernel DB entry with GEMM-family classification only.
 
     Detection priority:
       1. CLI overrides (shared_dim_override / routed_dim_override)
@@ -444,9 +445,10 @@ def classify_kernel_entries(
             op_profile reconstruction when using the MoE pipeline).
 
     Returns:
-        New list of entries, each annotated with ``expert_type`` (broad classifier),
-        ``structural_role`` (dim-exact match when possible, else expand/contract
-        refinement for shared/routed), and ``model_dims``.
+        New list of entries, each annotated with:
+        - ``expert_type`` (GEMM-family coarse type or non_gemm)
+        - ``gemm_structural_role`` (GEMM-only structural role; non_gemm otherwise)
+        - ``model_dims`` (detected dims)
     """
     debug_print(
         "classify:start",
@@ -581,8 +583,8 @@ def classify_kernel_entries(
             "assigned=", group_type[weight_shape],
         )
 
-    # Refine structural_role from dims + expand/contract (does not change expert_type).
-    group_structural_role: Dict[Tuple[int, ...], str] = {}
+    # Refine GEMM structural role from dims + expand/contract (does not change expert_type).
+    group_gemm_role: Dict[Tuple[int, ...], str] = {}
     for weight_shape, et in group_type.items():
         output_dim, input_dim = group_dims[weight_shape]
         entries = group_entries[weight_shape]
@@ -596,29 +598,33 @@ def classify_kernel_entries(
             routed_dim=routed_dim,
             num_experts=num_experts,
         )
-        group_structural_role[weight_shape] = sr
+        # If the GEMM doesn't match a known MoE role, keep a distinct unknown bucket.
+        if sr == "other":
+            sr = "unknown_gemm"
+        group_gemm_role[weight_shape] = sr
         append_moe_op_profile_debug(
             moe_debug_log_path,
             f"[moe.detect] weight_shape={weight_shape} "
             f"output_dim={output_dim} input_dim={input_dim} "
-            f"expert_type={et} structural_role={sr}",
+            f"expert_type={et} gemm_structural_role={sr}",
         )
 
-    # Build annotated output (copy each entry, add expert_type/structural_role/model_dims)
+    # Build annotated output (copy each entry, add expert_type/gemm_structural_role/model_dims)
     result = []
     for entry in kernels:
         annotated = copy.copy(entry)
         if _is_gemm_entry(entry):
             weight_shape = _get_weight_shape(entry)
             if weight_shape is not None and weight_shape in group_type:
-                annotated["expert_type"] = group_type[weight_shape]
-                annotated["structural_role"] = group_structural_role.get(weight_shape, "other")
+                et = group_type[weight_shape]
+                annotated["expert_type"] = et if et != "other" else "unknown_gemm"
+                annotated["gemm_structural_role"] = group_gemm_role.get(weight_shape, "unknown_gemm")
             else:
-                annotated["expert_type"] = "other"
-                annotated["structural_role"] = "other"
+                annotated["expert_type"] = "unknown_gemm"
+                annotated["gemm_structural_role"] = "unknown_gemm"
         else:
-            annotated["expert_type"] = "other"
-            annotated["structural_role"] = "other"
+            annotated["expert_type"] = "non_gemm"
+            annotated["gemm_structural_role"] = "non_gemm"
         annotated["model_dims"] = {
             "hidden_dim": hidden_dim_raw,
             "shared_dim": shared_dim,

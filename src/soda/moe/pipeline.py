@@ -249,7 +249,7 @@ class MoEProfilePipeline:
                 continue
 
             et = entry.get("expert_type", "other")
-            sr = entry.get("structural_role", "other")
+            sr = entry.get("gemm_structural_role", "unknown_gemm")
             aten_name = entry.get("aten_op", {}).get("name", "") or ""
             cleaned_kernel = clean_kernel_name(entry.get("kernel", {}).get("name", "") or "")
             shape_sig = _shape_signature(entry.get("aten_op", {}).get("input_dims", []))
@@ -360,7 +360,7 @@ class MoEProfilePipeline:
         # 3) Bucket scoring + budget/coverage selection
         buckets_by_role: Dict[str, List[Dict[str, Any]]] = {}
         for b in buckets:
-            buckets_by_role.setdefault(b.get("structural_role", "other"), []).append(b)
+            buckets_by_role.setdefault(b.get("structural_role", "unknown_gemm"), []).append(b)
         role_priority = {"routed_expert": 3, "shared_expert": 2, "gate": 1}
         for role, blist in buckets_by_role.items():
             blist.sort(

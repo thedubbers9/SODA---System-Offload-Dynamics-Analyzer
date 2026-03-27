@@ -33,6 +33,16 @@ _GEMM_OPS = frozenset({
     "aten::_grouped_mm",
 })
 
+_GEMM_STRUCTURAL_ROLES = frozenset({
+    "shared_expert_expand",
+    "shared_expert_down",
+    "routed_expert_expand",
+    "routed_expert_down",
+    "moe_gate",
+    "attention",
+    "unknown_gemm",
+})
+
 _MEANINGFUL_PREFIXES = (
     "aten::rms_norm",
     "aten::native_layer_norm",
@@ -622,20 +632,21 @@ def _match_kernel_db_entry_indexed(
 def _infer_semantic_role(
     aten_name: str,
     expert_type: str,
-    structural_role: str,
+    gemm_structural_role: str,
     input_dims: Optional[List] = None,
 ) -> str:
-    if structural_role == "moe_gate" or expert_type == "gate":
+    # Legacy semantic role kept for back-compat aggregation/plots.
+    if gemm_structural_role == "moe_gate" or expert_type == "gate":
         return "moe_gate"
-    if structural_role == "shared_expert_expand":
+    if gemm_structural_role == "shared_expert_expand":
         return "shared_expert_expand"
-    if structural_role == "shared_expert_down":
+    if gemm_structural_role == "shared_expert_down":
         return "shared_expert_down"
-    if structural_role == "routed_expert_expand":
+    if gemm_structural_role == "routed_expert_expand":
         return "routed_expert_expand"
-    if structural_role == "routed_expert_down":
+    if gemm_structural_role == "routed_expert_down":
         return "routed_expert_down"
-    if expert_type == "attention" or structural_role == "attention":
+    if expert_type == "attention" or gemm_structural_role == "attention":
         return "attention"
     if "softmax" in aten_name or aten_name == "aten::scaled_dot_product_attention":
         return "attention"
@@ -663,6 +674,204 @@ def _infer_semantic_role(
     if aten_name in ("aten::copy_", "aten::clone", "aten::contiguous"):
         return "copy / other"
     return "copy / other"
+
+
+def _non_gemm_op_family(aten_name: str, cleaned_kernel: str) -> str:
+    """Heuristic non-GEMM op-family classifier (broad + debuggable)."""
+    a = (aten_name or "").lower()
+    k = (cleaned_kernel or "").lower()
+
+    # GPU memcpy/memset pseudo-ops (trace cat) land here with aten_name=="".
+    if "memcpy" in k or "memset" in k:
+        return "copy_layout"
+
+    if a in ("aten::copy_", "aten::clone", "aten::contiguous", "aten::_to_copy", "aten::to"):
+        return "copy_layout"
+    if "contiguous" in a or "as_strided" in a or "view" in a or "reshape" in a:
+        return "copy_layout"
+
+    if "norm" in a or "rms_norm" in a or a in ("aten::native_layer_norm", "aten::layer_norm"):
+        return "normalization"
+
+    if any(x in a for x in ("index_select", "gather", "scatter", "index", "take", "embedding", "lookup")):
+        return "indexing_or_routing"
+
+    if any(x in a for x in ("topk", "argsort", "sort", "multinomial")):
+        return "routing_metadata"
+
+    if any(x in a for x in ("cat", "concat", "split", "chunk", "stack", "unbind", "pack", "unpack")):
+        return "dispatch_combine"
+
+    if any(x in a for x in ("sum", "mean", "amax", "amin", "reduce", "cumsum")):
+        return "reduction"
+
+    if a in (
+        "aten::mul", "aten::add", "aten::div", "aten::sub",
+        "aten::silu", "aten::gelu", "aten::relu", "aten::sigmoid", "aten::tanh",
+        "aten::exp", "aten::sqrt",
+    ):
+        return "elementwise"
+
+    if any(x in a for x in ("softmax", "scaled_dot_product_attention")):
+        return "attention_aux"
+
+    return "unknown_non_gemm"
+
+
+def _initial_structural_role_from_gemm(gemm_structural_role: str) -> str:
+    if gemm_structural_role in _GEMM_STRUCTURAL_ROLES:
+        return gemm_structural_role
+    return "unknown_gemm"
+
+
+def _initial_structural_role_from_non_gemm_family(family: str) -> str:
+    if family == "normalization":
+        return "normalization"
+    if family == "copy_layout":
+        return "copy_layout"
+    if family == "indexing_or_routing":
+        return "indexing_or_routing"
+    if family == "routing_metadata":
+        return "routing_metadata"
+    if family == "dispatch_combine":
+        return "dispatch_combine"
+    if family == "attention_aux":
+        return "attention_aux"
+    if family == "elementwise":
+        return "elementwise_misc"
+    if family == "reduction":
+        return "elementwise_misc"
+    return "unknown"
+
+
+def _byte_class(weight_bytes: float, activation_bytes: float, kv_bytes: float) -> str:
+    wb = float(weight_bytes or 0.0)
+    ab = float(activation_bytes or 0.0)
+    kb = float(kv_bytes or 0.0)
+    if kb > 0 and wb == 0 and ab > 0:
+        return "kv_cache"
+    if wb > 0 and ab > 0:
+        return "weight+activation"
+    if wb > 0:
+        return "weight"
+    if ab > 0:
+        return "activation"
+    return "unknown"
+
+
+def _placement_class(structural_role: str, byte_class: str) -> str:
+    # Keep placement policy orthogonal to structural meaning.
+    sr = structural_role or "unknown"
+    if sr.startswith("shared_expert_") and byte_class in ("weight", "weight+activation"):
+        return "shared_expert_weight_candidate"
+    if sr.startswith("routed_expert_") and byte_class in ("weight", "weight+activation"):
+        return "routed_expert_weight_candidate"
+    if sr in ("moe_intermediate", "dispatch_combine", "routing_metadata") and byte_class in ("activation", "weight+activation"):
+        return "moe_workspace_candidate"
+    if sr in ("attention_aux",) and byte_class == "activation":
+        return "attention_workspace_candidate"
+    return "non_candidate"
+
+
+def _sram_candidate_class(placement_class: str) -> str:
+    if placement_class in ("shared_expert_weight_candidate",):
+        return "shared_weight"
+    if placement_class in ("routed_expert_weight_candidate",):
+        return "routed_weight"
+    if placement_class in ("moe_workspace_candidate",):
+        return "moe_workspace"
+    if placement_class in ("attention_workspace_candidate",):
+        return "attention_workspace"
+    return "none"
+
+
+def _nearest_confident_roles(
+    rows: List[Dict[str, Any]],
+    i: int,
+    *,
+    window: int,
+) -> Dict[str, Optional[Tuple[int, str]]]:
+    """Find nearest confident structural roles around i (same layer, any stream)."""
+    lid = rows[i].get("layer_id")
+    prev = None
+    nxt = None
+    for j in range(i - 1, max(-1, i - window - 1), -1):
+        if rows[j].get("layer_id") != lid:
+            continue
+        sr = rows[j].get("structural_role")
+        if sr in _GEMM_STRUCTURAL_ROLES:
+            prev = (j, sr)
+            break
+    for j in range(i + 1, min(len(rows), i + window + 1)):
+        if rows[j].get("layer_id") != lid:
+            continue
+        sr = rows[j].get("structural_role")
+        if sr in _GEMM_STRUCTURAL_ROLES:
+            nxt = (j, sr)
+            break
+    return {"prev": prev, "next": nxt}
+
+
+def _trace_context_relabel(rows: List[Dict[str, Any]], *, window: int = 6) -> List[Dict[str, Any]]:
+    """Second pass: relabel non-GEMM ops into trace-meaningful buckets using context.
+
+    Guardrails:
+    - Never change confident GEMM structural roles.
+    - Only relabel when context evidence is strong.
+    """
+    relabeled: List[Dict[str, Any]] = []
+    for i, r in enumerate(rows):
+        sr = r.get("structural_role", "unknown")
+        if sr in _GEMM_STRUCTURAL_ROLES:
+            continue
+        family = r.get("op_family", "unknown_non_gemm")
+        ctx = _nearest_confident_roles(rows, i, window=window)
+        prev = ctx["prev"][1] if ctx["prev"] else None
+        nxt = ctx["next"][1] if ctx["next"] else None
+
+        new_sr = None
+
+        # Attention neighborhood → attention_aux for nearby non-GEMMs.
+        if (prev == "attention" or nxt == "attention") and family in (
+            "elementwise", "normalization", "copy_layout", "unknown_non_gemm", "attention_aux",
+        ):
+            new_sr = "attention_aux"
+
+        # Gate → routed expert expand neighborhood: likely routing/dispatch metadata or glue.
+        if new_sr is None and prev == "moe_gate" and nxt in ("routed_expert_expand", "routed_expert_down"):
+            if family in ("routing_metadata", "indexing_or_routing", "dispatch_combine"):
+                new_sr = "dispatch_combine" if family == "dispatch_combine" else "routing_metadata"
+            elif family in ("elementwise", "copy_layout", "unknown_non_gemm", "reduction"):
+                new_sr = "routing_metadata"
+
+        # Near routed expert phases: intermediate activations / workspace traffic.
+        if new_sr is None and (prev and prev.startswith("routed_expert_") or (nxt and nxt.startswith("routed_expert_"))):
+            if family in ("elementwise", "normalization", "copy_layout", "dispatch_combine", "indexing_or_routing", "unknown_non_gemm"):
+                new_sr = "moe_intermediate"
+
+        # Near shared expert phases: intermediate activations can still be meaningful.
+        if new_sr is None and (prev and prev.startswith("shared_expert_") or (nxt and nxt.startswith("shared_expert_"))):
+            if family in ("elementwise", "normalization", "copy_layout", "unknown_non_gemm"):
+                new_sr = "moe_intermediate"
+
+        if new_sr is not None and new_sr != sr:
+            old = sr
+            r["structural_role"] = new_sr
+            r["classification_source"] = "trace_context"
+            r["classification_confidence"] = "medium"
+            relabeled.append({
+                "exec_index": r.get("exec_index"),
+                "layer_id": r.get("layer_id"),
+                "aten": r.get("aten_op", {}).get("name"),
+                "kernel": r.get("gpu_event", {}).get("cleaned_name"),
+                "op_family": family,
+                "old_structural_role": old,
+                "new_structural_role": new_sr,
+                "prev_confident": prev,
+                "next_confident": nxt,
+                "hbm_bytes": r.get("hbm_bytes"),
+            })
+    return relabeled
 
 
 def detect_num_layers_from_shared_patterns(classified: List[Dict]) -> int:
@@ -798,8 +1007,10 @@ def build_execution_trace(
             layer_id = 0
             aten_name = ""
             input_dims: List = []
-            expert_type = "other"
-            structural_role = "other"
+            expert_type = "non_gemm"
+            gemm_structural_role = "unknown"
+            structural_role = "unknown"
+            op_family = "unknown_non_gemm"
             src_entry_id = None
             if exec_index % 10000 == 0:
                 debug_print("build_execution_trace:no_parent", "exec_index=", exec_index, "gpu_name=", ev.get("name"))
@@ -819,12 +1030,16 @@ def build_execution_trace(
                     candidates_by_cleaned=candidates_by_cleaned,
                 )
             if match is not None:
-                expert_type = match.get("expert_type", "other")
-                structural_role = match.get("structural_role", "other")
+                expert_type = match.get("expert_type", "non_gemm")
+                gemm_structural_role = match.get("gemm_structural_role", "unknown_gemm")
+                structural_role = _initial_structural_role_from_gemm(gemm_structural_role)
+                op_family = "gemm" if aten_name in _GEMM_OPS else "unknown_non_gemm"
                 src_entry_id = match.get("id")
             else:
-                expert_type = "other"
-                structural_role = "other"
+                expert_type = "non_gemm"
+                gemm_structural_role = "non_gemm"
+                op_family = _non_gemm_op_family(aten_name, cleaned)
+                structural_role = _initial_structural_role_from_non_gemm_family(op_family)
                 src_entry_id = None
             if exec_index % 10000 == 0:
                 debug_print(
@@ -833,15 +1048,19 @@ def build_execution_trace(
                     "aten=", aten_name,
                     "layer_id=", layer_id,
                     "expert_type=", expert_type,
+                    "gemm_structural_role=", gemm_structural_role,
                     "structural_role=", structural_role,
                     "matched_entry=", src_entry_id,
                 )
 
         semantic_role = _infer_semantic_role(
-            aten_name, expert_type, structural_role, input_dims
+            aten_name, expert_type, gemm_structural_role, input_dims
         )
         if ev["kind"] == "gpu_memcpy":
             semantic_role = "copy / other"
+            op_family = "copy_layout"
+            gemm_structural_role = "non_gemm"
+            structural_role = "copy_layout"
 
         hbm_fields = _compute_hbm_fields(aten_name, input_dims, dtype_b)
         hbm_byte_data_from_ncu = False
@@ -876,6 +1095,7 @@ def build_execution_trace(
             "kind": ev["kind"],
             "layer_id": layer_id,
             "semantic_role": semantic_role,
+            "op_family": op_family,
             "aten_op": {
                 "name": aten_name,
                 "input_dims": input_dims,
@@ -905,9 +1125,21 @@ def build_execution_trace(
             "cta_count": int(cta_count),
             "is_shared_expert": bool(is_shared),
             "expert_type": expert_type,
+            "gemm_structural_role": gemm_structural_role,
             "structural_role": structural_role,
+            "byte_class": _byte_class(
+                float(hbm_fields["weight_bytes"]),
+                float(hbm_fields["activation_bytes"]),
+                float(hbm_fields["kv_bytes"]),
+            ),
+            "placement_class": None,  # filled below
+            "sram_candidate_class": None,  # filled below
+            "classification_source": "gemm_shape" if structural_role in _GEMM_STRUCTURAL_ROLES else "non_gemm_heuristic",
+            "classification_confidence": "high" if structural_role in _GEMM_STRUCTURAL_ROLES else "low",
             "source_kernel_db_entry_id": src_entry_id,
         }
+        row["placement_class"] = _placement_class(row["structural_role"], row["byte_class"])
+        row["sram_candidate_class"] = _sram_candidate_class(row["placement_class"])
         rows[exec_index] = row
     debug_print(
         "build_execution_trace:summary",
@@ -915,8 +1147,43 @@ def build_execution_trace(
         "kernels=", sum(1 for r in rows if r and r.get("kind") == "gpu_kernel"),
         "memcpy=", sum(1 for r in rows if r and r.get("kind") == "gpu_memcpy"),
     )
+    relabeled = _trace_context_relabel(rows, window=6)
+    debug_print(
+        "build_execution_trace:context_relabel",
+        "relabeled_count=", len(relabeled),
+    )
     debug_print("build_execution_trace:done", "rows=", len(rows))
     return rows
+
+
+def _traffic_summaries(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Debug/inspection payload: HBM by structural/byte/placement + unknown drilldown."""
+    by_structural = Counter()
+    by_byte_class = Counter()
+    by_placement = Counter()
+    unknown_aten = Counter()
+    unknown_kernel = Counter()
+
+    for r in rows:
+        hb = float(r.get("hbm_bytes") or 0.0)
+        by_structural[r.get("structural_role", "unknown")] += hb
+        by_byte_class[r.get("byte_class", "unknown")] += hb
+        by_placement[r.get("placement_class", "unknown")] += hb
+
+        if r.get("structural_role") == "unknown":
+            unknown_aten[r.get("aten_op", {}).get("name") or ""] += hb
+            unknown_kernel[r.get("gpu_event", {}).get("cleaned_name") or ""] += hb
+
+    def _top(counter: Counter, n: int = 20) -> List[Dict[str, Any]]:
+        return [{"name": k, "hbm_bytes": round(v, 2)} for k, v in counter.most_common(n)]
+
+    return {
+        "hbm_by_structural_role": {k: round(v, 2) for k, v in by_structural.items()},
+        "hbm_by_byte_class": {k: round(v, 2) for k, v in by_byte_class.items()},
+        "hbm_by_placement_class": {k: round(v, 2) for k, v in by_placement.items()},
+        "unknown_top_aten_ops": _top(unknown_aten, 30),
+        "unknown_top_cleaned_kernels": _top(unknown_kernel, 30),
+    }
 
 
 def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
@@ -928,8 +1195,12 @@ def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
         "hbm_bytes_ncu": 0.0,
         "hbm_bytes_estimated": 0.0,
         "by_role": Counter(),
+        "by_structural_role": Counter(),
+        "by_placement_class": Counter(),
     })
     per_role: Counter = Counter()
+    per_structural: Counter = Counter()
+    per_placement: Counter = Counter()
     expert_hbm = defaultdict(float)
     expert_time = defaultdict(float)
 
@@ -955,6 +1226,12 @@ def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
         role = r.get("semantic_role", "other")
         pl["by_role"][role] += 1
         per_role[role] += hb
+        sr = r.get("structural_role", "unknown")
+        pl["by_structural_role"][sr] += hb
+        per_structural[sr] += hb
+        pc = r.get("placement_class", "unknown")
+        pl["by_placement_class"][pc] += hb
+        per_placement[pc] += hb
         et = r.get("expert_type", "other")
         if et in ("shared_expert", "routed_expert", "gate"):
             expert_hbm[et] += hb
@@ -972,11 +1249,15 @@ def _aggregate(rows: List[Dict[str, Any]], num_layers: int) -> Dict[str, Any]:
         d = dict(per_layer[L])
         d["layer_id"] = L
         d["by_role"] = dict(d["by_role"])
+        d["by_structural_role"] = dict(d["by_structural_role"])
+        d["by_placement_class"] = dict(d["by_placement_class"])
         layer_list.append(d)
 
     return {
         "per_layer": layer_list,
         "per_semantic_role": dict(per_role),
+        "per_structural_role": {k: round(v, 2) for k, v in per_structural.items()},
+        "per_placement_class": {k: round(v, 2) for k, v in per_placement.items()},
         "expert_totals": {
             k: {"hbm_bytes": round(v, 2), "time_us": round(expert_time[k], 2)}
             for k, v in expert_hbm.items()
@@ -1037,6 +1318,45 @@ def generate_op_profile(
         et_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
         debug_print("op_profile_gen:execution_trace_written", et_path)
 
+    # Always emit a debug summary alongside op_profile.json when possible.
+    summaries = _traffic_summaries(rows)
+    if output_path is not None:
+        summary_path = Path(output_path).with_name("trace_label_summary.json")
+        summary_path.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
+        debug_print("op_profile_gen:trace_label_summary_written", summary_path)
+        append_moe_op_profile_debug(
+            moe_debug_log_path,
+            f"[moe.op_profile] wrote trace label summary {summary_path}",
+        )
+
+        # Also emit a small set of relabel examples for inspection.
+        # (We don't persist the full relabel list in the execution trace to keep it lightweight.)
+        try:
+            # Re-run relabel discovery by diffing sources (trace_context rows are already updated).
+            examples = [
+                {
+                    "exec_index": r.get("exec_index"),
+                    "layer_id": r.get("layer_id"),
+                    "aten": r.get("aten_op", {}).get("name"),
+                    "kernel": r.get("gpu_event", {}).get("cleaned_name"),
+                    "op_family": r.get("op_family"),
+                    "structural_role": r.get("structural_role"),
+                    "classification_source": r.get("classification_source"),
+                    "hbm_bytes": r.get("hbm_bytes"),
+                }
+                for r in rows
+                if r.get("classification_source") == "trace_context"
+            ][:200]
+            relabel_path = Path(output_path).with_name("trace_context_relabels_sample.json")
+            relabel_path.write_text(json.dumps(examples, indent=2), encoding="utf-8")
+            debug_print("op_profile_gen:trace_context_relabels_written", relabel_path)
+            append_moe_op_profile_debug(
+                moe_debug_log_path,
+                f"[moe.op_profile] wrote trace context relabel samples {relabel_path}",
+            )
+        except Exception as e:
+            debug_print("op_profile_gen:trace_context_relabels_write_failed", str(e))
+
     aggregates = _aggregate(rows, num_layers)
     debug_print("op_profile_gen:aggregated", "keys=", list(aggregates.keys()))
 
@@ -1048,6 +1368,8 @@ def generate_op_profile(
         "num_layers": num_layers,
         "row_count": len(rows),
         "aggregates": aggregates,
+        "trace_label_summary_file": str(Path(output_path).with_name("trace_label_summary.json").resolve())
+        if output_path is not None else None,
     }
 
     if output_path is not None:
