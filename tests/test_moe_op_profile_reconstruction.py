@@ -94,7 +94,7 @@ def _minimal_one_mm_trace():
 def test_launch_kernel_correlation_join(tmp_path, classified_mm_entry):
     trace_path = tmp_path / "t.json"
     trace_path.write_text(json.dumps(_minimal_one_mm_trace()))
-    rows = build_execution_trace(
+    rows, _ = build_execution_trace(
         trace_path, classified_mm_entry, num_layers=1, precision="bfloat16"
     )
     assert len(rows) == 1
@@ -108,7 +108,7 @@ def test_launch_kernel_correlation_join(tmp_path, classified_mm_entry):
 def test_ncu_attaches_after_trace(tmp_path, classified_mm_entry):
     trace_path = tmp_path / "t.json"
     trace_path.write_text(json.dumps(_minimal_one_mm_trace()))
-    rows = build_execution_trace(
+    rows, _ = build_execution_trace(
         trace_path,
         classified_mm_entry,
         num_layers=1,
@@ -129,7 +129,7 @@ def test_memcpy_classified_as_copy(tmp_path, classified_mm_entry):
     }
     p = tmp_path / "t.json"
     p.write_text(json.dumps(trace))
-    rows = build_execution_trace(p, classified_mm_entry, num_layers=1)
+    rows, _ = build_execution_trace(p, classified_mm_entry, num_layers=1)
     assert len(rows) == 2
     assert rows[1]["kind"] == "gpu_memcpy"
     assert rows[1]["semantic_role"] == "copy / other"
@@ -172,3 +172,86 @@ def test_generate_op_profile_writes_files(tmp_path, classified_mm_entry):
     assert disk["schema_version"] == 2
     assert "aggregates" in disk
     assert disk["row_count"] == 1
+
+
+def test_routed_expert_support_ops_relabeling(tmp_path):
+    # Synthetic routed-expert local block pattern.
+    trace = {
+        "traceEvents": [
+            _aten("aten::nonzero", 10, 10, 1, [[128, 60]]),
+            _launch(25, 2, 1, 1),
+            _kernel("DeviceSelectSweepKernel", 30, 8, 1, 1),
+            _aten("aten::index", 40, 10, 2, [[128, 2048], [128]]),
+            _launch(55, 2, 2, 2),
+            _kernel("vectorized_gather_kernel", 60, 8, 2, 2),
+            _aten("aten::mm", 70, 15, 3, [[128, 2048], [2048, 1408]]),
+            _launch(90, 2, 3, 3),
+            _kernel("routed_expand_kernel_0", 95, 10, 3, 3),
+            _aten("aten::silu", 110, 8, 4, [[128, 1408]]),
+            _launch(122, 2, 4, 4),
+            _kernel("silu_kernel", 126, 8, 4, 4),
+            _aten("aten::mm", 140, 15, 5, [[128, 1408], [1408, 1408]]),
+            _launch(160, 2, 5, 5),
+            _kernel("routed_expand_kernel_1", 165, 10, 5, 5),
+            _aten("aten::mul", 180, 8, 6, [[128, 1408], [128, 1408]]),
+            _launch(192, 2, 6, 6),
+            _kernel("mul_gate_kernel", 196, 8, 6, 6),
+            _aten("aten::mm", 210, 15, 7, [[128, 1408], [1408, 2048]]),
+            _launch(230, 2, 7, 7),
+            _kernel("routed_down_kernel", 235, 10, 7, 7),
+            _aten("aten::mul", 250, 8, 8, [[128, 2048], [128, 1]]),
+            _launch(262, 2, 8, 8),
+            _kernel("expert_scale_kernel", 266, 8, 8, 8),
+            _aten("aten::index_add_", 280, 8, 9, [[1024, 2048], [128], [128, 2048]]),
+            _launch(292, 2, 9, 9),
+            _kernel("index_add_kernel", 296, 8, 9, 9),
+        ]
+    }
+    trace_path = tmp_path / "routed_trace.json"
+    trace_path.write_text(json.dumps(trace))
+    classified = [
+        {
+            "id": "K_EXP_0",
+            "aten_op": {"name": "aten::mm", "input_dims": [[128, 2048], [2048, 1408]]},
+            "kernel": {"name": "routed_expand_kernel_0", "raw_name": "routed_expand_kernel_0"},
+            "expert_type": "routed_expert",
+            "gemm_structural_role": "routed_expert_expand",
+            "statistics": {},
+        },
+        {
+            "id": "K_EXP_1",
+            "aten_op": {"name": "aten::mm", "input_dims": [[128, 1408], [1408, 1408]]},
+            "kernel": {"name": "routed_expand_kernel_1", "raw_name": "routed_expand_kernel_1"},
+            "expert_type": "routed_expert",
+            "gemm_structural_role": "routed_expert_expand",
+            "statistics": {},
+        },
+        {
+            "id": "K_DOWN",
+            "aten_op": {"name": "aten::mm", "input_dims": [[128, 1408], [1408, 2048]]},
+            "kernel": {"name": "routed_down_kernel", "raw_name": "routed_down_kernel"},
+            "expert_type": "routed_expert",
+            "gemm_structural_role": "routed_expert_down",
+            "statistics": {},
+        },
+    ]
+    rows, relabel = build_execution_trace(trace_path, classified, num_layers=1, precision="bfloat16")
+    roles_by_aten = {r.get("aten_op", {}).get("name"): [] for r in rows}
+    for r in rows:
+        roles_by_aten.setdefault(r.get("aten_op", {}).get("name"), []).append(r.get("structural_role"))
+
+    assert "moe_dispatch_gather" in roles_by_aten.get("aten::index", [])
+    assert "routed_expert_activation" in roles_by_aten.get("aten::silu", [])
+    assert "routed_expert_gating_mul" in roles_by_aten.get("aten::mul", [])
+    assert "moe_expert_scale" in roles_by_aten.get("aten::mul", [])
+    assert "moe_combine_scatter" in roles_by_aten.get("aten::index_add_", [])
+    assert "routing_metadata" in roles_by_aten.get("aten::nonzero", [])
+
+    key_aten = {"aten::nonzero", "aten::index", "aten::silu", "aten::mul", "aten::index_add_"}
+    for r in rows:
+        if r.get("aten_op", {}).get("name") in key_aten:
+            assert r.get("structural_role") != "unknown"
+            assert r.get("structural_role") != "elementwise_misc"
+            assert r.get("structural_role") != "copy_layout"
+
+    assert relabel["relabeled_count"] > 0

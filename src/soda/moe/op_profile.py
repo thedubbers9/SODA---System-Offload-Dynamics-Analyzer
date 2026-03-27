@@ -43,6 +43,16 @@ _GEMM_STRUCTURAL_ROLES = frozenset({
     "unknown_gemm",
 })
 
+_ROUTED_SUPPORT_STRUCTURAL_ROLES = frozenset({
+    "routing_metadata",
+    "moe_dispatch_gather",
+    "routed_expert_activation",
+    "routed_expert_gating_mul",
+    "moe_expert_scale",
+    "moe_combine_scatter",
+    "moe_aux_indexing",
+})
+
 _MEANINGFUL_PREFIXES = (
     "aten::rms_norm",
     "aten::native_layer_norm",
@@ -763,26 +773,349 @@ def _placement_class(structural_role: str, byte_class: str) -> str:
     # Keep placement policy orthogonal to structural meaning.
     sr = structural_role or "unknown"
     if sr.startswith("shared_expert_") and byte_class in ("weight", "weight+activation"):
-        return "shared_expert_weight_candidate"
+        return "persistent_weight_candidate"
     if sr.startswith("routed_expert_") and byte_class in ("weight", "weight+activation"):
-        return "routed_expert_weight_candidate"
-    if sr in ("moe_intermediate", "dispatch_combine", "routing_metadata") and byte_class in ("activation", "weight+activation"):
+        return "persistent_weight_candidate"
+    if sr in ("moe_intermediate", "dispatch_combine", "moe_dispatch_gather", "routed_expert_activation", "routed_expert_gating_mul", "moe_expert_scale", "moe_combine_scatter", "moe_aux_indexing") and byte_class in ("activation", "weight+activation"):
         return "moe_workspace_candidate"
+    if sr == "routing_metadata":
+        return "routing_metadata"
     if sr in ("attention_aux",) and byte_class == "activation":
         return "attention_workspace_candidate"
     return "non_candidate"
 
 
 def _sram_candidate_class(placement_class: str) -> str:
-    if placement_class in ("shared_expert_weight_candidate",):
+    if placement_class in ("persistent_weight_candidate",):
         return "shared_weight"
-    if placement_class in ("routed_expert_weight_candidate",):
-        return "routed_weight"
     if placement_class in ("moe_workspace_candidate",):
         return "moe_workspace"
     if placement_class in ("attention_workspace_candidate",):
         return "attention_workspace"
     return "none"
+
+
+def _dims_2d(shape: Any) -> Optional[Tuple[int, int]]:
+    dims = _normalize_shape(shape)
+    if len(dims) != 2:
+        return None
+    return (int(dims[0]), int(dims[1]))
+
+
+def _mul_shapes_2d(row: Dict[str, Any]) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+    dims = row.get("aten_op", {}).get("input_dims", []) or []
+    if len(dims) < 2:
+        return (None, None)
+    return (_dims_2d(dims[0]), _dims_2d(dims[1]))
+
+
+def _is_gather_like_row(row: Dict[str, Any]) -> bool:
+    aten = (row.get("aten_op", {}).get("name") or "").lower()
+    kernel = (row.get("gpu_event", {}).get("cleaned_name") or "").lower()
+    if aten in ("aten::index", "aten::gather", "aten::index_select", "aten::take"):
+        return True
+    return "gather" in kernel or "vectorized_gather_kernel" in kernel
+
+
+def _is_routing_metadata_row(row: Dict[str, Any]) -> bool:
+    aten = (row.get("aten_op", {}).get("name") or "").lower()
+    kernel = (row.get("gpu_event", {}).get("cleaned_name") or "").lower()
+    gpu_name = (row.get("gpu_event", {}).get("name") or "").lower()
+    if aten in ("aten::nonzero", "aten::topk", "aten::argsort", "aten::sort"):
+        return True
+    if "devicecompactinitkernel" in kernel or "deviceselectsweepkernel" in kernel:
+        return True
+    if "index" in kernel and ("write" in kernel or "put" in kernel):
+        return True
+    if row.get("kind") == "gpu_memcpy" and "dtoh" in gpu_name and float(row.get("hbm_bytes") or 0.0) <= 65536:
+        return True
+    return False
+
+
+def _is_index_add_or_scatter(row: Dict[str, Any]) -> bool:
+    aten = (row.get("aten_op", {}).get("name") or "").lower()
+    kernel = (row.get("gpu_event", {}).get("cleaned_name") or "").lower()
+    if aten == "aten::index_add_" or "scatter" in aten or aten.endswith("scatter_"):
+        return True
+    return ("index_add" in kernel) or ("scatter" in kernel and "gather" not in kernel)
+
+
+def _is_other_like_structural_role(role: str) -> bool:
+    return role in ("unknown", "copy_layout", "indexing_or_routing", "dispatch_combine", "elementwise_misc")
+
+
+def _set_row_role(
+    row: Dict[str, Any],
+    new_role: str,
+    source: str,
+    confidence: str,
+    *,
+    allow_override_from: Optional[frozenset] = None,
+) -> bool:
+    old = row.get("structural_role", "unknown")
+    if old == new_role:
+        return False
+    if allow_override_from is not None and old not in allow_override_from:
+        return False
+    row["structural_role"] = new_role
+    row["classification_source"] = source
+    row["classification_confidence"] = confidence
+    row["placement_class"] = _placement_class(row["structural_role"], row.get("byte_class", "unknown"))
+    row["sram_candidate_class"] = _sram_candidate_class(row["placement_class"])
+    return True
+
+
+def _find_same_layer_window_indices(
+    rows: List[Dict[str, Any]],
+    i: int,
+    *,
+    back: int,
+    fwd: int,
+) -> List[int]:
+    lid = rows[i].get("layer_id")
+    out: List[int] = []
+    lo = max(0, i - back)
+    hi = min(len(rows), i + fwd + 1)
+    for j in range(lo, hi):
+        if rows[j].get("layer_id") == lid:
+            out.append(j)
+    return out
+
+
+def _routed_expert_context_relabel(
+    rows: List[Dict[str, Any]],
+    *,
+    window: int = 8,
+) -> Dict[str, Any]:
+    """Best-effort routed-expert support op relabeling around known routed GEMMs."""
+    relabeled: List[Dict[str, Any]] = []
+    previous_other_like = {
+        int(r.get("exec_index", -1)): r.get("structural_role", "unknown")
+        for r in rows
+        if _is_other_like_structural_role(r.get("structural_role", "unknown"))
+    }
+
+    by_layer: Dict[int, List[int]] = defaultdict(list)
+    for idx, row in enumerate(rows):
+        by_layer[int(row.get("layer_id", 0))].append(idx)
+
+    for layer_id, layer_indices in by_layer.items():
+        routed_expand = [j for j in layer_indices if rows[j].get("structural_role") == "routed_expert_expand"]
+        routed_down = [j for j in layer_indices if rows[j].get("structural_role") == "routed_expert_down"]
+        if not routed_expand or not routed_down:
+            continue
+
+        for ex_i in routed_expand:
+            ex_neighbors = _find_same_layer_window_indices(rows, ex_i, back=window, fwd=window)
+            pre_indices = [j for j in ex_neighbors if j < ex_i]
+            post_indices = [j for j in ex_neighbors if j > ex_i]
+
+            prev_gather = None
+            for j in reversed(pre_indices):
+                if _is_gather_like_row(rows[j]):
+                    prev_gather = j
+                    break
+            if prev_gather is not None and float(rows[prev_gather].get("activation_bytes") or 0.0) > 0:
+                if _set_row_role(
+                    rows[prev_gather],
+                    "moe_dispatch_gather",
+                    "routed_expert_context",
+                    "medium",
+                    allow_override_from=frozenset({"unknown", "copy_layout", "indexing_or_routing", "dispatch_combine"}),
+                ):
+                    relabeled.append({
+                        "exec_index": rows[prev_gather].get("exec_index"),
+                        "layer_id": layer_id,
+                        "old_structural_role": previous_other_like.get(int(rows[prev_gather].get("exec_index", -1)), "other"),
+                        "new_structural_role": "moe_dispatch_gather",
+                        "aten": rows[prev_gather].get("aten_op", {}).get("name"),
+                        "kernel": rows[prev_gather].get("gpu_event", {}).get("cleaned_name"),
+                        "hbm_bytes": float(rows[prev_gather].get("hbm_bytes") or 0.0),
+                    })
+
+            # Relabel nearby nonzero/compaction metadata on routed path.
+            for j in ex_neighbors:
+                if j == ex_i:
+                    continue
+                if _is_routing_metadata_row(rows[j]):
+                    if _set_row_role(
+                        rows[j],
+                        "routing_metadata",
+                        "routed_expert_context",
+                        "medium",
+                        allow_override_from=frozenset({"unknown", "copy_layout", "indexing_or_routing", "dispatch_combine"}),
+                    ):
+                        relabeled.append({
+                            "exec_index": rows[j].get("exec_index"),
+                            "layer_id": layer_id,
+                            "old_structural_role": previous_other_like.get(int(rows[j].get("exec_index", -1)), "other"),
+                            "new_structural_role": "routing_metadata",
+                            "aten": rows[j].get("aten_op", {}).get("name"),
+                            "kernel": rows[j].get("gpu_event", {}).get("cleaned_name"),
+                            "hbm_bytes": float(rows[j].get("hbm_bytes") or 0.0),
+                        })
+
+            second_expand = None
+            for j in post_indices:
+                if rows[j].get("structural_role") == "routed_expert_expand":
+                    second_expand = j
+                    break
+            if second_expand is None:
+                continue
+
+            down_idx = None
+            for j in post_indices:
+                if j <= second_expand:
+                    continue
+                if rows[j].get("structural_role") == "routed_expert_down":
+                    down_idx = j
+                    break
+            if down_idx is None:
+                continue
+
+            # SiLU between expand GEMMs.
+            for j in range(ex_i + 1, second_expand):
+                if rows[j].get("aten_op", {}).get("name") == "aten::silu":
+                    if _set_row_role(
+                        rows[j],
+                        "routed_expert_activation",
+                        "routed_expert_context",
+                        "medium",
+                        allow_override_from=frozenset({"unknown", "elementwise_misc", "copy_layout"}),
+                    ):
+                        relabeled.append({
+                            "exec_index": rows[j].get("exec_index"),
+                            "layer_id": layer_id,
+                            "old_structural_role": previous_other_like.get(int(rows[j].get("exec_index", -1)), "other"),
+                            "new_structural_role": "routed_expert_activation",
+                            "aten": rows[j].get("aten_op", {}).get("name"),
+                            "kernel": rows[j].get("gpu_event", {}).get("cleaned_name"),
+                            "hbm_bytes": float(rows[j].get("hbm_bytes") or 0.0),
+                        })
+
+            # Gating mul between second expand and down.
+            for j in range(second_expand + 1, down_idx):
+                if rows[j].get("aten_op", {}).get("name") != "aten::mul":
+                    continue
+                s0, s1 = _mul_shapes_2d(rows[j])
+                if s0 is not None and s1 is not None and s0 == s1:
+                    if _set_row_role(
+                        rows[j],
+                        "routed_expert_gating_mul",
+                        "routed_expert_context",
+                        "medium",
+                        allow_override_from=frozenset({"unknown", "elementwise_misc", "copy_layout"}),
+                    ):
+                        relabeled.append({
+                            "exec_index": rows[j].get("exec_index"),
+                            "layer_id": layer_id,
+                            "old_structural_role": previous_other_like.get(int(rows[j].get("exec_index", -1)), "other"),
+                            "new_structural_role": "routed_expert_gating_mul",
+                            "aten": rows[j].get("aten_op", {}).get("name"),
+                            "kernel": rows[j].get("gpu_event", {}).get("cleaned_name"),
+                            "hbm_bytes": float(rows[j].get("hbm_bytes") or 0.0),
+                        })
+
+            # Post-down scale + combine/scatter.
+            tail_hi = min(len(rows), down_idx + window + 1)
+            for j in range(down_idx + 1, tail_hi):
+                if rows[j].get("layer_id") != layer_id:
+                    continue
+                if rows[j].get("aten_op", {}).get("name") == "aten::mul":
+                    s0, s1 = _mul_shapes_2d(rows[j])
+                    if s0 is not None and s1 is not None:
+                        is_scale = (
+                            (s0[0] == s1[0] and s0[1] > 1 and s1[1] == 1)
+                            or (s1[0] == s0[0] and s1[1] > 1 and s0[1] == 1)
+                        )
+                        if is_scale and _set_row_role(
+                            rows[j],
+                            "moe_expert_scale",
+                            "routed_expert_context",
+                            "medium",
+                            allow_override_from=frozenset({"unknown", "elementwise_misc", "copy_layout"}),
+                        ):
+                            relabeled.append({
+                                "exec_index": rows[j].get("exec_index"),
+                                "layer_id": layer_id,
+                                "old_structural_role": previous_other_like.get(int(rows[j].get("exec_index", -1)), "other"),
+                                "new_structural_role": "moe_expert_scale",
+                                "aten": rows[j].get("aten_op", {}).get("name"),
+                                "kernel": rows[j].get("gpu_event", {}).get("cleaned_name"),
+                                "hbm_bytes": float(rows[j].get("hbm_bytes") or 0.0),
+                            })
+
+                if _is_index_add_or_scatter(rows[j]):
+                    if _set_row_role(
+                        rows[j],
+                        "moe_combine_scatter",
+                        "routed_expert_context",
+                        "high",
+                        allow_override_from=frozenset({"unknown", "copy_layout", "indexing_or_routing", "dispatch_combine"}),
+                    ):
+                        relabeled.append({
+                            "exec_index": rows[j].get("exec_index"),
+                            "layer_id": layer_id,
+                            "old_structural_role": previous_other_like.get(int(rows[j].get("exec_index", -1)), "other"),
+                            "new_structural_role": "moe_combine_scatter",
+                            "aten": rows[j].get("aten_op", {}).get("name"),
+                            "kernel": rows[j].get("gpu_event", {}).get("cleaned_name"),
+                            "hbm_bytes": float(rows[j].get("hbm_bytes") or 0.0),
+                        })
+                # Generic aux indexing around routed path.
+                elif rows[j].get("aten_op", {}).get("name") in ("aten::index", "aten::gather", "aten::index_select"):
+                    if _set_row_role(
+                        rows[j],
+                        "moe_aux_indexing",
+                        "routed_expert_context",
+                        "low",
+                        allow_override_from=frozenset({"unknown", "copy_layout", "indexing_or_routing"}),
+                    ):
+                        relabeled.append({
+                            "exec_index": rows[j].get("exec_index"),
+                            "layer_id": layer_id,
+                            "old_structural_role": previous_other_like.get(int(rows[j].get("exec_index", -1)), "other"),
+                            "new_structural_role": "moe_aux_indexing",
+                            "aten": rows[j].get("aten_op", {}).get("name"),
+                            "kernel": rows[j].get("gpu_event", {}).get("cleaned_name"),
+                            "hbm_bytes": float(rows[j].get("hbm_bytes") or 0.0),
+                        })
+
+    moved_out_bytes = 0.0
+    moved_out_count = 0
+    for row in rows:
+        exec_index = int(row.get("exec_index", -1))
+        old = previous_other_like.get(exec_index)
+        new = row.get("structural_role", "unknown")
+        if old is not None and new in _ROUTED_SUPPORT_STRUCTURAL_ROLES:
+            moved_out_bytes += float(row.get("hbm_bytes") or 0.0)
+            moved_out_count += 1
+
+    role_bytes = Counter()
+    role_examples: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        sr = row.get("structural_role", "unknown")
+        if sr in _ROUTED_SUPPORT_STRUCTURAL_ROLES:
+            role_bytes[sr] += float(row.get("hbm_bytes") or 0.0)
+            if len(role_examples[sr]) < 8:
+                role_examples[sr].append({
+                    "exec_index": row.get("exec_index"),
+                    "layer_id": row.get("layer_id"),
+                    "aten": row.get("aten_op", {}).get("name"),
+                    "kernel": row.get("gpu_event", {}).get("cleaned_name"),
+                    "hbm_bytes": float(row.get("hbm_bytes") or 0.0),
+                    "classification_source": row.get("classification_source"),
+                })
+
+    return {
+        "window": window,
+        "relabeled_count": len(relabeled),
+        "moved_out_of_other_like_count": moved_out_count,
+        "moved_out_of_other_like_hbm_bytes": round(moved_out_bytes, 2),
+        "hbm_by_new_structural_role": {k: round(v, 2) for k, v in role_bytes.items()},
+        "top_examples": dict(role_examples),
+        "relabels": relabeled[:400],
+    }
 
 
 def _nearest_confident_roles(
@@ -900,8 +1233,8 @@ def build_execution_trace(
     num_layers: int,
     precision: str = "bfloat16",
     ncu_results: Optional[Dict[str, Dict]] = None,
-) -> List[Dict[str, Any]]:
-    """Ordered GPU execution rows with layer_id, semantic role, optional NCU."""
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Ordered GPU execution rows plus routed-expert relabel debug report."""
     debug_print(
         "build_execution_trace:start",
         "trace_path=", trace_path,
@@ -1147,13 +1480,13 @@ def build_execution_trace(
         "kernels=", sum(1 for r in rows if r and r.get("kind") == "gpu_kernel"),
         "memcpy=", sum(1 for r in rows if r and r.get("kind") == "gpu_memcpy"),
     )
-    relabeled = _trace_context_relabel(rows, window=6)
+    relabeled = _routed_expert_context_relabel(rows, window=8)
     debug_print(
         "build_execution_trace:context_relabel",
-        "relabeled_count=", len(relabeled),
+        "relabeled_count=", relabeled.get("relabeled_count", 0),
     )
     debug_print("build_execution_trace:done", "rows=", len(rows))
-    return rows
+    return rows, relabeled
 
 
 def _traffic_summaries(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1300,7 +1633,7 @@ def generate_op_profile(
         f"[moe.op_profile] trace-centric build trace={trace_path} num_layers={num_layers}",
     )
 
-    rows = build_execution_trace(
+    rows, routed_relabel_report = build_execution_trace(
         trace_path=trace_path,
         classified=classified_kernels,
         num_layers=num_layers,
@@ -1329,33 +1662,17 @@ def generate_op_profile(
             f"[moe.op_profile] wrote trace label summary {summary_path}",
         )
 
-        # Also emit a small set of relabel examples for inspection.
-        # (We don't persist the full relabel list in the execution trace to keep it lightweight.)
+        # Emit routed-expert relabel debug report for support-op verification.
         try:
-            # Re-run relabel discovery by diffing sources (trace_context rows are already updated).
-            examples = [
-                {
-                    "exec_index": r.get("exec_index"),
-                    "layer_id": r.get("layer_id"),
-                    "aten": r.get("aten_op", {}).get("name"),
-                    "kernel": r.get("gpu_event", {}).get("cleaned_name"),
-                    "op_family": r.get("op_family"),
-                    "structural_role": r.get("structural_role"),
-                    "classification_source": r.get("classification_source"),
-                    "hbm_bytes": r.get("hbm_bytes"),
-                }
-                for r in rows
-                if r.get("classification_source") == "trace_context"
-            ][:200]
-            relabel_path = Path(output_path).with_name("trace_context_relabels_sample.json")
-            relabel_path.write_text(json.dumps(examples, indent=2), encoding="utf-8")
-            debug_print("op_profile_gen:trace_context_relabels_written", relabel_path)
+            relabel_path = Path(output_path).with_name("routed_expert_relabel_report.json")
+            relabel_path.write_text(json.dumps(routed_relabel_report, indent=2), encoding="utf-8")
+            debug_print("op_profile_gen:routed_relabel_report_written", relabel_path)
             append_moe_op_profile_debug(
                 moe_debug_log_path,
-                f"[moe.op_profile] wrote trace context relabel samples {relabel_path}",
+                f"[moe.op_profile] wrote routed-expert relabel report {relabel_path}",
             )
         except Exception as e:
-            debug_print("op_profile_gen:trace_context_relabels_write_failed", str(e))
+            debug_print("op_profile_gen:routed_relabel_report_write_failed", str(e))
 
     aggregates = _aggregate(rows, num_layers)
     debug_print("op_profile_gen:aggregated", "keys=", list(aggregates.keys()))
@@ -1369,6 +1686,8 @@ def generate_op_profile(
         "row_count": len(rows),
         "aggregates": aggregates,
         "trace_label_summary_file": str(Path(output_path).with_name("trace_label_summary.json").resolve())
+        if output_path is not None else None,
+        "routed_expert_relabel_report_file": str(Path(output_path).with_name("routed_expert_relabel_report.json").resolve())
         if output_path is not None else None,
     }
 
