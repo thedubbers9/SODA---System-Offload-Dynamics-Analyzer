@@ -28,7 +28,7 @@ Experiment directory: `<output-dir>/<model>_<precision>_bs<B>_sl<S>_mt<T>/`
 | `kernel_database.json` | `--kernel-db` | Op-to-kernel mapping; required for Stage 2 |
 | `taxbreak/enhanced_taxbreak.json` | Stage 2 | Per-kernel isolation-replay breakdown |
 | `taxbreak/roofline.png` | Stage 2 + `--ncu` | GPU roofline plot |
-| `moe_profile/op_profile.json` | Stage 3 | Per-kernel per-layer records with `is_shared_expert` |
+| `moe_profile/execution_trace.json` | Stage 3 | Per-kernel records with `is_shared_expert` |
 | `moe_profile/moe_profile.json` | Stage 3 | NCU isolation aggregates per expert type (empty if ncu unavailable) |
 
 ## Installation
