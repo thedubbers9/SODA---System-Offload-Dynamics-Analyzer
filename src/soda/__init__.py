@@ -1098,7 +1098,7 @@ class ModelTracer:
         utils.save_json(self.output_dir / "stage1_run_metadata.json", meta)
 
     @classmethod
-    def from_completed_profile(cls, args: argparse.Namespace, output_dir: Path) -> ModelTracer:
+    def from_completed_profile(cls, args: argparse.Namespace, output_dir: Path) -> "ModelTracer":
         """
         Reconstruct tracer state after a child process wrote ``trace.json`` and metadata
         (used with ``--nsys-hbm`` parent orchestration).
