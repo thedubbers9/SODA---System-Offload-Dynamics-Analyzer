@@ -926,6 +926,82 @@ def get_args_parser() -> argparse.ArgumentParser:
              "structural role (shared/routed expand/down and moe_gate).",
     )
 
+    # --- Nsight Systems sampled HBM attribution (Stage 1, parent process orchestrates nsys) ---
+    parser.add_argument(
+        "--nsys-hbm",
+        dest="nsys_hbm",
+        action="store_true",
+        help="Run Stage 1 benchmark under nsys profile with GPU metrics; export SQLite "
+             "and attribute sampled DRAM bandwidth to kernels (estimated, not per-kernel HW counters).",
+    )
+    parser.add_argument(
+        "--internal-stage1-benchmark",
+        dest="internal_stage1_benchmark",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--nsys-bin",
+        dest="nsys_bin",
+        type=str,
+        default="nsys",
+        help="Path to nsys CLI.",
+    )
+    parser.add_argument(
+        "--nsys-output",
+        dest="nsys_output",
+        type=str,
+        default=None,
+        help="Optional basename/prefix for nsys report (default: nsys_hbm/nsys_capture in experiment dir).",
+    )
+    parser.add_argument(
+        "--nsys-gpu-metrics-devices",
+        dest="nsys_gpu_metrics_devices",
+        type=str,
+        default="all",
+        help="Passed to nsys --gpu-metrics-devices (default: all).",
+    )
+    parser.add_argument(
+        "--nsys-gpu-metrics-set",
+        dest="nsys_gpu_metrics_set",
+        type=str,
+        default=None,
+        help="If set, passed to nsys --gpu-metrics-set.",
+    )
+    parser.add_argument(
+        "--nsys-gpu-metrics-frequency",
+        dest="nsys_gpu_metrics_frequency",
+        type=int,
+        default=10000,
+        help="Passed to nsys --gpu-metrics-frequency (Hz; default 10000).",
+    )
+    parser.add_argument(
+        "--nsys-force-overwrite",
+        dest="nsys_force_overwrite",
+        action="store_true",
+        help="Delete existing nsys report/SQLite under the output prefix before profiling.",
+    )
+    parser.add_argument(
+        "--nsys-keep-intermediate",
+        dest="nsys_keep_intermediate",
+        action="store_true",
+        help="Keep .nsys-rep, .sqlite, and do not delete intermediate captures.",
+    )
+    parser.add_argument(
+        "--nsys-sqlite",
+        dest="nsys_sqlite",
+        type=str,
+        default=None,
+        help="Skip profiling/export; ingest this existing Nsight SQLite file.",
+    )
+    parser.add_argument(
+        "--gpu-peak-hbm-bandwidth-gbps",
+        dest="gpu_peak_hbm_bandwidth_gbps",
+        type=float,
+        default=None,
+        help="Peak GPU HBM bandwidth (GB/s) for converting Nsight percent-of-peak DRAM metrics to B/s.",
+    )
+
     return parser
 
 def parse_and_validate_args(args=None) -> argparse.Namespace:
@@ -964,6 +1040,12 @@ def parse_and_validate_args(args=None) -> argparse.Namespace:
             if capability[0] < 9 and not (capability[0] == 8 and capability[1] >= 9):
                 print(f"Warning: FP8 typically requires SM89+ (Ada/Hopper). Detected SM{capability[0]}{capability[1]}.", file=sys.stderr)
                 print("FP8 may not be hardware-accelerated on this device.", file=sys.stderr)
+
+    if getattr(parsed_args, "nsys_hbm", False):
+        if parsed_args.device != "cuda" or not torch.cuda.is_available():
+            parser.error("--nsys-hbm requires CUDA and --device cuda.")
+    if getattr(parsed_args, "nsys_hbm", False) and getattr(parsed_args, "microbench", False):
+        parser.error("--nsys-hbm cannot be combined with --microbench.")
     
     return parsed_args
 
@@ -1149,7 +1231,7 @@ def collect_events(trace: Dict[str, Any]) -> Dict[str, Any]:
         # GPU kernel events
         if cat == "kernel":
             args = event.get("args", {})
-            kernel_events.append({
+            rec: Dict[str, Any] = {
                 "name": name,
                 "ts": event["ts"],
                 "dur": event.get("dur", 0),
@@ -1162,12 +1244,16 @@ def collect_events(trace: Dict[str, Any]) -> Dict[str, Any]:
                 "registers_per_thread": args.get("registers per thread", None),
                 "stream": args.get("stream"),   # CUDA stream ID (Fix A)
                 "device": args.get("device"),   # GPU device index (Fix A)
-            })
+            }
+            for ak, av in args.items():
+                if isinstance(ak, str) and ak.startswith("nsys_hbm_"):
+                    rec[ak] = av
+            kernel_events.append(rec)
 
         # GPU memory events
         elif cat in ("gpu_memcpy", "gpu_memset"):
             args = event.get("args", {})
-            gpu_mem_events.append({
+            mrec: Dict[str, Any] = {
                 "name": name,
                 "ts": event["ts"],
                 "dur": event.get("dur", 0),
@@ -1175,7 +1261,11 @@ def collect_events(trace: Dict[str, Any]) -> Dict[str, Any]:
                 "cat": cat,
                 "stream": args.get("stream"),   # Fix A
                 "device": args.get("device"),   # Fix A
-            })
+            }
+            for ak, av in args.items():
+                if isinstance(ak, str) and ak.startswith("nsys_hbm_"):
+                    mrec[ak] = av
+            gpu_mem_events.append(mrec)
         
         # CUDA launch events (CPU side).
         # cuBLAS/Cutlass kernels are dispatched via the CUDA Driver API
@@ -1665,6 +1755,26 @@ def generate_experiment_name(
         f"_bs{batch_size}_sl{seq_len}_mt{max_new_tokens}"
     )
     return f"{base}_gpu{num_gpus}" if num_gpus > 1 else base
+
+
+def resolve_experiment_output_dir(args: argparse.Namespace) -> Path:
+    """
+    Experiment directory ``<output_dir>/<experiment_name>`` matching ModelTracer layout.
+    """
+    has_cuda = torch.cuda.is_available()
+    requested = max(1, getattr(args, "num_gpus", 1))
+    available = torch.cuda.device_count() if has_cuda else 0
+    num_gpus = min(requested, max(1, available)) if has_cuda else 1
+    name = generate_experiment_name(
+        args.model,
+        args.compile_type,
+        args.precision,
+        args.batch_size,
+        args.seq_len,
+        args.max_new_tokens,
+        num_gpus=num_gpus,
+    )
+    return Path(args.output_dir) / name
 
 
 def calculate_total_inference_time(trace: Dict[str, Any]) -> float:

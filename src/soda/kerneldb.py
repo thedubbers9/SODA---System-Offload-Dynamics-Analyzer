@@ -7,9 +7,10 @@ a structured database for downstream TaxBreak analysis.
 
 import json
 import math
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -237,6 +238,45 @@ def generate_kernel_database(
             },
         })
 
+    nsys_summary_path = output_path.parent / "nsys_hbm" / "attribution_summary.json"
+    nsys_summary: Dict[str, Any] = {}
+    if nsys_summary_path.is_file():
+        with open(nsys_summary_path, "r", encoding="utf-8") as _nf:
+            nsys_summary = json.load(_nf)
+
+    acc_nsys: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+        lambda: {"r": 0.0, "w": 0.0, "t": 0.0}
+    )
+    for seq in last_run_seqs:
+        k = seq.get("kernel") or {}
+        a = seq.get("aten_op") or {}
+        ck = clean_kernel_name(k.get("name", ""))
+        ak = a.get("name", "")
+        key = (ck, ak)
+        for fld, short in (
+            ("nsys_hbm_estimated_read_bytes", "r"),
+            ("nsys_hbm_estimated_write_bytes", "w"),
+            ("nsys_hbm_estimated_total_bytes", "t"),
+        ):
+            v = k.get(fld)
+            if v is not None:
+                try:
+                    acc_nsys[key][short] += float(v)
+                except (TypeError, ValueError):
+                    pass
+    for e in db_entries:
+        ck = e["kernel"]["name"]
+        ak = e["aten_op"].get("name", "")
+        block = acc_nsys.get((ck, ak))
+        if block and (block["t"] > 0 or block["r"] > 0 or block["w"] > 0):
+            e["nsys_hbm"] = {
+                "nsys_hbm_estimated_read_bytes": round(block["r"], 2),
+                "nsys_hbm_estimated_write_bytes": round(block["w"], 2),
+                "nsys_hbm_estimated_total_bytes": round(block["t"], 2),
+                "nsys_hbm_attribution_method": "sample_overlap",
+                "nsys_hbm_metric_source": "nsight_systems_gpu_metrics",
+            }
+
     # --- Step 7: build top-level database ---
     total_unique = len(db_entries)
     lib_mediated_count = sum(1 for e in db_entries if e["classification"]["is_library_mediated"])
@@ -256,6 +296,7 @@ def generate_kernel_database(
             "timestamp": datetime.now().isoformat(),
             "num_profiled_runs": num_runs,
             "last_run_sequences": len(last_run_seqs),
+            **({"nsys_hbm_attribution_summary": nsys_summary} if nsys_summary else {}),
         },
         "summary": {
             "total_unique_kernels": total_unique,

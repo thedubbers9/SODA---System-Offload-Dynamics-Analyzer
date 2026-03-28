@@ -476,6 +476,17 @@ class SodaAnalyzer:
         # Add fusion results if available
         if "fusion_results" in self.results:
             output["fusion_analysis"] = self.results["fusion_results"]
+
+        nsys_summary_path = self.output_dir / "nsys_hbm" / "attribution_summary.json"
+        if nsys_summary_path.is_file():
+            with open(nsys_summary_path, "r", encoding="utf-8") as _nf:
+                output["nsys_hbm_attribution"] = json.load(_nf)
+            try:
+                from soda.nsys import top_kernels_by_nsys_bytes
+
+                output["nsys_hbm_top_kernels"] = top_kernels_by_nsys_bytes(self.tracer.trace_file, k=20)
+            except Exception:
+                output["nsys_hbm_top_kernels"] = []
         
         # Save to file
         utils.save_json(self.report_file, output)
@@ -1072,6 +1083,64 @@ class ModelTracer:
             "attention_mask": attention_mask
         }
 
+    def write_stage1_metadata(self) -> None:
+        """Persist profiling results so the parent process can analyze without reloading the model."""
+        meta = {
+            "experiment_name": self.experiment_name,
+            "torch_measured_inference_time_us": self.torch_measured_inference_time_us,
+            "num_profiled_runs": getattr(self, "num_profiled_runs", 1),
+            "memory_metrics": self.memory_metrics,
+            "num_gpus": self.num_gpus,
+            "is_decoder": self.is_decoder,
+            "is_encoder": self.is_encoder,
+            "is_whisper": self.is_whisper,
+        }
+        utils.save_json(self.output_dir / "stage1_run_metadata.json", meta)
+
+    @classmethod
+    def from_completed_profile(cls, args: argparse.Namespace, output_dir: Path) -> ModelTracer:
+        """
+        Reconstruct tracer state after a child process wrote ``trace.json`` and metadata
+        (used with ``--nsys-hbm`` parent orchestration).
+        """
+        output_dir = Path(output_dir)
+        self = cls.__new__(cls)
+        self.args = args
+        self.model_name = args.model
+        self._has_cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self._has_cuda and args.device == "cuda" else "cpu")
+        meta_path = output_dir / "stage1_run_metadata.json"
+        meta = utils.load_json(meta_path)
+        self.experiment_name = meta.get("experiment_name", output_dir.name)
+        self.output_dir = output_dir
+        self.trace_file = output_dir / "trace.json"
+        self.compile_type = args.compile_type
+        self.is_fp8 = args.precision == "float8_e4m3fn"
+        self.precision = utils.parse_dtype_to_torch(args.precision)
+        self.load_precision = torch.bfloat16 if self.is_fp8 else self.precision
+        self.batch_size = args.batch_size
+        self.seq_len = args.seq_len
+        self.max_new_tokens = args.max_new_tokens
+        self.num_gpus = int(meta.get("num_gpus", getattr(args, "num_gpus", 1)))
+        self.is_whisper = bool(meta.get("is_whisper", False))
+        self.is_encoder = bool(meta.get("is_encoder", False))
+        self.is_decoder = bool(meta.get("is_decoder", True))
+        self.torch_measured_inference_time_us = meta.get("torch_measured_inference_time_us")
+        self.num_profiled_runs = int(meta.get("num_profiled_runs", 1))
+        self.memory_metrics = meta.get("memory_metrics")
+        self.model = None
+        self.tokenizer = None
+        self.model_inputs = None
+        self.trace_data = utils.load_json(self.trace_file)
+        self._model_memory_bytes = 0
+        self._model_memory_reserved_bytes = 0
+        self._pre_inference_bytes = 0
+        self._peak_allocated_bytes = 0
+        self._peak_reserved_bytes = 0
+        self._kv_cache_bytes = 0
+        self.process()
+        return self
+
     def run(self) -> None:
         """
         Complete tracing pipeline
@@ -1079,6 +1148,8 @@ class ModelTracer:
         self.setup()
         self.trace()
         self.process()
+        if getattr(self.args, "internal_stage1_benchmark", False):
+            self.write_stage1_metadata()
     
     def trace(self) -> None:
         """
@@ -1385,6 +1456,107 @@ def main() -> int:
     try:
         # Parse and validate arguments
         args = utils.parse_and_validate_args()
+
+        # --- Child entry: benchmark + trace only (invoked under nsys by parent) ---
+        if getattr(args, "internal_stage1_benchmark", False):
+            tracer = ModelTracer(args=args)
+            tracer.run()
+            return 0
+
+        # --- Stage 1 with Nsight Systems GPU metrics (parent orchestrates nsys) ---
+        if getattr(args, "nsys_hbm", False):
+            from soda.nsys import (
+                export_nsys_sqlite,
+                run_nsys_hbm_attribution,
+                run_nsys_profile,
+                strip_nsys_parent_argv,
+                verify_nsys_available,
+            )
+
+            verify_nsys_available(args.nsys_bin)
+            exp_dir = utils.resolve_experiment_output_dir(args)
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            nsys_sub = exp_dir / "nsys_hbm"
+            nsys_sub.mkdir(parents=True, exist_ok=True)
+            out_base = Path(args.nsys_output).resolve() if args.nsys_output else (nsys_sub / "nsys_capture").resolve()
+            rep = Path(str(out_base) + ".nsys-rep")
+            sqlite_path = Path(str(out_base) + ".sqlite")
+
+            if args.nsys_sqlite:
+                sqlite_path = Path(args.nsys_sqlite).resolve()
+                if not sqlite_path.is_file():
+                    print(f"Error: --nsys-sqlite file not found: {sqlite_path}", file=sys.stderr)
+                    return 1
+            else:
+                if getattr(args, "nsys_force_overwrite", False):
+                    for p in (rep, sqlite_path):
+                        if p.exists():
+                            p.unlink()
+                child_argv = strip_nsys_parent_argv(sys.argv[1:])
+                if "--internal-stage1-benchmark" not in child_argv:
+                    child_argv = child_argv + ["--internal-stage1-benchmark"]
+                prof_args = [
+                    "--trace=cuda,nvtx,osrt",
+                    f"--gpu-metrics-devices={args.nsys_gpu_metrics_devices}",
+                    f"--gpu-metrics-frequency={args.nsys_gpu_metrics_frequency}",
+                    "--sample=none",
+                    "--cpuctxsw=none",
+                    "--output",
+                    str(out_base),
+                ]
+                if args.nsys_gpu_metrics_set:
+                    prof_args.append(f"--gpu-metrics-set={args.nsys_gpu_metrics_set}")
+                if getattr(args, "nsys_force_overwrite", False):
+                    prof_args.extend(["--force-overwrite", "true"])
+                print(f"=== Nsight Systems profiling → {out_base} ===")
+                run_nsys_profile(args.nsys_bin, prof_args, sys.executable, child_argv, cwd=None)
+                if not rep.is_file():
+                    print(f"Error: expected nsys report at {rep}", file=sys.stderr)
+                    return 1
+                export_nsys_sqlite(
+                    args.nsys_bin,
+                    rep,
+                    sqlite_path,
+                    force=bool(getattr(args, "nsys_force_overwrite", False)),
+                )
+                if not getattr(args, "nsys_keep_intermediate", False) and rep.is_file():
+                    try:
+                        rep.unlink()
+                    except OSError:
+                        pass
+
+            trace_path = exp_dir / "trace.json"
+            if not trace_path.is_file():
+                print(f"Error: trace.json missing at {trace_path}", file=sys.stderr)
+                return 1
+
+            run_nsys_hbm_attribution(
+                sqlite_path,
+                trace_path,
+                nsys_sub,
+                peak_hbm_gbps=getattr(args, "gpu_peak_hbm_bandwidth_gbps", None),
+                keep_raw=bool(getattr(args, "nsys_keep_intermediate", False)),
+            )
+            print(f"=== Nsight HBM attribution written under {nsys_sub} ===")
+
+            print(f"Loading analysis from: {exp_dir.resolve()}")
+            tracer = ModelTracer.from_completed_profile(args=args, output_dir=exp_dir)
+
+            if args.microbench:
+                print(
+                    "Warning: skipping --microbench after --nsys-hbm (child did not run microbench).",
+                    file=sys.stderr,
+                )
+            analyzer = SodaAnalyzer(tracer=tracer, args=args)
+            analyzer.run()
+
+            if getattr(args, "kernel_db", False):
+                from soda.kerneldb import generate_kernel_database
+
+                db_path = tracer.output_dir / "kernel_database.json"
+                generate_kernel_database(tracer=tracer, args=args, output_path=db_path)
+
+            return 0
 
         # --- Enhanced TaxBreak mode (Stage 2: no model loading) ---
         if getattr(args, "taxbreak", False):

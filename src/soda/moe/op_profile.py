@@ -389,7 +389,7 @@ def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
         dur = event.get("dur", 0) or 0
 
         if cat == "kernel":
-            out.append({
+            rec: Dict[str, Any] = {
                 "kind": "gpu_kernel",
                 "name": name,
                 "ts": ts,
@@ -400,9 +400,13 @@ def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "device": args.get("device"),
                 "grid": args.get("grid", [0, 0, 0]),
                 "block": args.get("block", [0, 0, 0]),
-            })
+            }
+            for ak, av in args.items():
+                if isinstance(ak, str) and ak.startswith("nsys_hbm_"):
+                    rec[ak] = av
+            out.append(rec)
         elif cat in ("gpu_memcpy", "gpu_memset"):
-            out.append({
+            mrec: Dict[str, Any] = {
                 "kind": "gpu_memcpy",
                 "name": name,
                 "cat": cat,
@@ -411,7 +415,11 @@ def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "correlation": args.get("correlation"),
                 "stream": args.get("stream"),
                 "device": args.get("device"),
-            })
+            }
+            for ak, av in args.items():
+                if isinstance(ak, str) and ak.startswith("nsys_hbm_"):
+                    mrec[ak] = av
+            out.append(mrec)
             if len(out) % 50000 == 0 and len(out) > 0:
                 debug_print("iter_gpu_events:progress", "gpu_events=", len(out))
             debug_print("iter_gpu_events:done", "gpu_events=", len(out))
@@ -1473,6 +1481,9 @@ def build_execution_trace(
         }
         row["placement_class"] = _placement_class(row["structural_role"], row["byte_class"])
         row["sram_candidate_class"] = _sram_candidate_class(row["placement_class"])
+        for _k, _v in ev.items():
+            if isinstance(_k, str) and _k.startswith("nsys_hbm_"):
+                row[_k] = _v
         rows[exec_index] = row
     debug_print(
         "build_execution_trace:summary",
@@ -1690,6 +1701,22 @@ def generate_op_profile(
         "routed_expert_relabel_report_file": str(Path(output_path).with_name("routed_expert_relabel_report.json").resolve())
         if output_path is not None else None,
     }
+
+    nsys_agg = {
+        "nsys_hbm_estimated_read_bytes": 0.0,
+        "nsys_hbm_estimated_write_bytes": 0.0,
+        "nsys_hbm_estimated_total_bytes": 0.0,
+    }
+    for r in rows:
+        for nk in nsys_agg:
+            nv = r.get(nk)
+            if nv is not None:
+                nsys_agg[nk] += float(nv)
+    if any(v > 0 for v in nsys_agg.values()):
+        profile["nsys_hbm_aggregates"] = {k: round(v, 2) for k, v in nsys_agg.items()}
+        profile["nsys_hbm_estimated_total_gb"] = round(
+            nsys_agg["nsys_hbm_estimated_total_bytes"] / 1e9, 6
+        )
 
     if output_path is not None:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

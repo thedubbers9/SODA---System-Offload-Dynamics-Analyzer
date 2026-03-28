@@ -128,6 +128,15 @@ class MoEProfilePipeline:
         debug_print("report:done", "report_path=", report_path)
         print(f"\n[MoE Profile] Report: {report_path}")
 
+        nsys_path = self.kernel_db_path.parent / "nsys_hbm" / "attribution_summary.json"
+        if nsys_path.is_file():
+            with open(report_path, "r", encoding="utf-8") as f:
+                mrep = json.load(f)
+            with open(nsys_path, "r", encoding="utf-8") as f:
+                mrep["nsys_hbm_attribution_run"] = json.load(f)
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(mrep, f, indent=2)
+
         # 4. execution_trace.json + aggregated op_profile.json (trace-ordered)
         debug_print("num_layers:detect:start")
         num_layers = self._get_num_layers(classified)

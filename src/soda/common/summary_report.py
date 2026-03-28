@@ -671,6 +671,25 @@ def render_main_analysis(results: dict, args, output_dir: Path) -> str:
     if carbon:
         _console.print(_build_carbon_table(carbon))
 
+    nsys_path = output_dir / "nsys_hbm" / "attribution_summary.json"
+    if nsys_path.is_file():
+        import json as _json
+        with open(nsys_path, "r", encoding="utf-8") as _nf:
+            nh = _json.load(_nf)
+        _console.print(
+            Panel(
+                (
+                    f"Integrated HBM (sample windows): {float(nh.get('integrated_total_bytes', 0)) / 1e9:.4f} GB  |  "
+                    f"window conservation error: {float(nh.get('relative_error', 0)):.2e}\n"
+                    f"DRAM metrics: read={nh.get('dram_read_metric')}  write={nh.get('dram_write_metric')}  |  "
+                    f"peak GB/s used: {nh.get('peak_hbm_bandwidth_gbps_used')}"
+                ),
+                title="Nsight Systems HBM attribution (estimated)",
+                box=box.ROUNDED,
+                expand=False,
+            )
+        )
+
     _console.print()
 
     # ── HTML report ──

@@ -15,6 +15,8 @@ SODA implements the **TaxBreak methodology** for decomposing host-side overhead 
 
 **Stage 3 (MoE)** — per-kernel per-layer op profile with `is_shared_expert` flag; NCU isolation HBM bytes per expert type when Nsight Compute is available.
 
+**Nsight Systems HBM attribution (optional Stage 1)** — With `--nsys-hbm`, the benchmark subprocess runs under `nsys profile` with GPU Metrics sampling. SODA exports the report to SQLite, turns sampled DRAM read/write bandwidth into byte windows using timestamp spacing, attributes bytes to GPU intervals proportionally to overlap time, then maps that onto PyTorch trace kernels (read/write tracked separately). This is an **estimate** inferred from device-level sampling, not exact per-kernel hardware counters. [Nsight Compute](https://developer.nvidia.com/nsight-compute) (`--ncu` in TaxBreak) remains the higher-fidelity source for isolated kernels. Integrated totals over samples are checked against interval-level unassigned traffic in `attribution_summary.json`.
+
 ## Output Files
 
 Experiment directory: `<output-dir>/<model>_<precision>_bs<B>_sl<S>_mt<T>/`
@@ -30,6 +32,11 @@ Experiment directory: `<output-dir>/<model>_<precision>_bs<B>_sl<S>_mt<T>/`
 | `taxbreak/roofline.png` | Stage 2 + `--ncu` | GPU roofline plot |
 | `moe_profile/execution_trace.json` | Stage 3 | Per-kernel records with `is_shared_expert` |
 | `moe_profile/moe_profile.json` | Stage 3 | NCU isolation aggregates per expert type (empty if ncu unavailable) |
+| `nsys_hbm/nsys_metadata.json` | `--nsys-hbm` | Metric/kernel table discovery metadata from SQLite |
+| `nsys_hbm/sample_windows.csv` | `--nsys-hbm` | Integrated bandwidth windows (read/write/total bytes) |
+| `nsys_hbm/kernel_hbm_attribution.csv` | `--nsys-hbm` | Per Nsight GPU interval estimated bytes |
+| `nsys_hbm/attribution_summary.json` | `--nsys-hbm` | Conservation checks, unassigned bytes, metric names |
+| `nsys_hbm/unmatched_intervals.csv` | `--nsys-hbm` | Nsight intervals with no overlapping SODA GPU event |
 
 ## Installation
 
@@ -71,6 +78,27 @@ soda-cli --model gpt2 --output-dir output/ --seq-len 512 --batch-size 1 --num-gp
 | `--kernel-db` | off | Generate kernel database (required for Stage 2) |
 | `--carbon-intensity` | `400` | gCO₂eq/kWh — presets: FR=58, EU=295, US=386, CN=581 |
 | `--pue` | `1.1` | Power Usage Effectiveness |
+
+### Nsight Systems sampled HBM (`--nsys-hbm`)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--nsys-hbm` | off | Profile Stage 1 via `nsys profile` + SQLite attribution pipeline |
+| `--nsys-bin` | `nsys` | Path to `nsys` |
+| `--nsys-output` | `nsys_hbm/nsys_capture` | Output prefix for `.nsys-rep` / `.sqlite` |
+| `--nsys-gpu-metrics-devices` | `all` | `nsys` `--gpu-metrics-devices` |
+| `--nsys-gpu-metrics-set` | — | Optional `--gpu-metrics-set` |
+| `--nsys-gpu-metrics-frequency` | `10000` | Sampling frequency (Hz) |
+| `--nsys-force-overwrite` | off | Remove existing capture before profiling |
+| `--nsys-keep-intermediate` | off | Keep `.nsys-rep` and raw exports |
+| `--nsys-sqlite` | — | Ingest existing SQLite (skip profile + export) |
+| `--gpu-peak-hbm-bandwidth-gbps` | — | Peak HBM GB/s to convert percent-of-peak metrics to B/s |
+
+```bash
+source env.sh
+soda-cli -m gpt2 --output-dir output/ --kernel-db --nsys-hbm \
+  --gpu-peak-hbm-bandwidth-gbps 1000
+```
 
 ### Stage 2: Enhanced TaxBreak
 
