@@ -708,6 +708,80 @@ def _soda_gpu_events_from_trace(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def inject_nsys_gpu_intervals_into_chrome_trace(
+    sqlite_path: Path,
+    trace_path: Path,
+) -> int:
+    """
+    Append Chrome-trace GPU events from Nsight SQLite so ``trace.json`` contains
+    ``kernel`` / ``gpu_memcpy`` rows after CPU-only PyTorch profiling under ``nsys``.
+
+    PyTorch cannot use ``ProfilerActivity.CUDA`` while ``nsys profile`` owns the
+    CUPTI subscription. Timestamps use the same ns→µs mapping as attribution
+    (``ts`` = start_ns / 1000, ``dur`` = (end_ns - start_ns) / 1000).
+
+    Returns:
+        Number of events appended (0 if trace already had GPU X events).
+    """
+    trace_path = Path(trace_path)
+    with open(trace_path, "r", encoding="utf-8") as f:
+        trace = json.load(f)
+
+    events = trace.get("traceEvents", [])
+    has_gpu = any(
+        e.get("ph") == "X"
+        and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")
+        for e in events
+    )
+    if has_gpu:
+        return 0
+
+    conn = open_sqlite(Path(sqlite_path))
+    try:
+        intervals = load_gpu_execution_intervals(conn)
+    finally:
+        conn.close()
+
+    new_events: List[Dict[str, Any]] = []
+    for it in intervals:
+        s_ns = int(it["start_ns"])
+        e_ns = int(it["end_ns"])
+        if e_ns <= s_ns:
+            continue
+        name = str(it.get("name") or "unknown")
+        if it.get("kind") == "memcpy":
+            cat = "gpu_memcpy"
+            if "memset" in name.lower():
+                cat = "gpu_memset"
+        else:
+            cat = "kernel"
+        corr = it.get("correlation")
+        args: Dict[str, Any] = {
+            "nsys_injected": True,
+            "correlation": corr,
+            "stream": it.get("stream"),
+            "device": it.get("gpu_id", 0),
+        }
+        new_events.append(
+            {
+                "ph": "X",
+                "cat": cat,
+                "name": name,
+                "pid": 0,
+                "tid": 0,
+                "ts": s_ns / 1000.0,
+                "dur": (e_ns - s_ns) / 1000.0,
+                "args": args,
+            }
+        )
+
+    trace.setdefault("traceEvents", []).extend(new_events)
+    with open(trace_path, "w", encoding="utf-8") as f:
+        json.dump(trace, f)
+
+    return len(new_events)
+
+
 def _estimate_time_offset_ns(
     soda_events: Sequence[Dict[str, Any]],
     nsys_intervals: Sequence[Dict[str, Any]],

@@ -697,6 +697,13 @@ class ModelTracer:
     def _get_profiler_activities(self) -> List:
         """Returns the appropriate profiler activities based on device availability."""
         activities = [ProfilerActivity.CPU]
+        # Launched under `nsys profile`, Nsight already subscribes to CUPTI for CUDA.
+        # Enabling PyTorch's CUDA profiler too triggers CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED.
+        if getattr(self.args, "internal_stage1_benchmark", False) and self._has_cuda:
+            print(
+                "Profiling: CPU only (internal Stage 1 under nsys — GPU kernels come from Nsight export)"
+            )
+            return activities
         if self._has_cuda:
             activities.append(ProfilerActivity.CUDA)
             print("Profiling: CPU + CUDA")
@@ -1529,6 +1536,12 @@ def main() -> int:
             if not trace_path.is_file():
                 print(f"Error: trace.json missing at {trace_path}", file=sys.stderr)
                 return 1
+
+            from soda.nsys import inject_nsys_gpu_intervals_into_chrome_trace
+
+            n_added = inject_nsys_gpu_intervals_into_chrome_trace(sqlite_path, trace_path)
+            if n_added:
+                print(f"=== Injected {n_added} GPU interval(s) from Nsight SQLite into trace.json ===")
 
             run_nsys_hbm_attribution(
                 sqlite_path,
