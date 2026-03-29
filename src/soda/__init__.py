@@ -29,6 +29,7 @@ except ImportError:
 
 # Import utilities and microbenchmark pipeline components.
 from soda.common import utils
+from soda.common.power_sampling import power_profile_scope
 from soda.microbench.microbench import SodaMicrobench
 
 # Global logger reference
@@ -272,6 +273,9 @@ class SodaAnalyzer:
 
             # Carbon footprint
             "carbon_footprint": carbon_metrics,
+
+            # NVML board power (Stage 1; see power_timeseries.json / power_attribution.json)
+            "power_metrics": getattr(self.tracer, "power_metrics", None),
         }
         
         self.results = {
@@ -676,6 +680,13 @@ class ModelTracer:
 
         # Memory profiling (populated during setup/trace)
         self.memory_metrics = None
+        # NVML power sampling (Stage 1 profiled window)
+        self.power_metrics = None
+        self.power_attribution = None
+        self._power_timeseries_full = None
+        self._nvml_mono_start_ns = None
+        self._profile_mono_start_ns = None
+        self._profile_mono_end_ns = None
         self._model_memory_bytes = 0
         self._model_memory_reserved_bytes = 0
         self._pre_inference_bytes = 0
@@ -725,6 +736,62 @@ class ModelTracer:
             self._peak_reserved_bytes = sum(
                 torch.cuda.max_memory_reserved(i) for i in range(self.num_gpus)
             )
+
+    def _write_power_timeseries_file(self) -> None:
+        """Write NVML samples to power_timeseries.json (Stage 1)."""
+        ts = getattr(self, "_power_timeseries_full", None)
+        if not ts:
+            return
+        path = self.output_dir / "power_timeseries.json"
+        utils.save_json(
+            path,
+            {"summary": self.power_metrics, "samples": ts},
+        )
+        print(f"Power timeseries written to: {path}")
+
+    def _compute_power_attribution(self) -> None:
+        """Attribute NVML energy to kernel / ATen intervals (needs trace + power timeseries)."""
+        from soda.common.power_sampling import attribute_nvml_power_to_trace
+
+        self.power_attribution = None
+        ts = getattr(self, "_power_timeseries_full", None)
+        if not ts or not self.events:
+            return
+        t_nvml = getattr(self, "_nvml_mono_start_ns", None)
+        t_ps = getattr(self, "_profile_mono_start_ns", None)
+        t_pe = getattr(self, "_profile_mono_end_ns", None)
+        if t_nvml is None or t_ps is None or t_pe is None:
+            return
+        attr = attribute_nvml_power_to_trace(
+            self.events,
+            self.sequences or [],
+            ts,
+            t_nvml,
+            t_ps,
+            t_pe,
+            getattr(self, "num_profiled_runs", 1) or 1,
+            bool(getattr(self.args, "power_export_kernel_instances", False)),
+        )
+        self.power_attribution = attr
+        if isinstance(self.power_metrics, dict) and self.power_metrics.get("source") == "nvml":
+            self.power_metrics["attribution"] = attr
+
+    def _write_power_attribution_files(self) -> None:
+        """Write power_attribution.json and optional power_kernel_instances.json."""
+        import copy
+
+        attr = getattr(self, "power_attribution", None)
+        if not attr or not attr.get("available"):
+            return
+        payload = copy.deepcopy(attr)
+        inst = payload.pop("kernel_instances", None)
+        path = self.output_dir / "power_attribution.json"
+        utils.save_json(path, payload)
+        print(f"Power attribution written to: {path}")
+        if inst:
+            ipath = self.output_dir / "power_kernel_instances.json"
+            utils.save_json(ipath, inst)
+            print(f"Per-kernel instance energies written to: {ipath}")
 
     def setup(self) -> None:
         """
@@ -1095,6 +1162,8 @@ class ModelTracer:
         self.trace_data = utils.load_json(self.trace_file)
         print(f"Chrome trace file generated at: {self.trace_file}")
 
+        self._write_power_timeseries_file()
+
         # Build memory metrics from snapshots captured during setup/trace
         if self._has_cuda:
             self.memory_metrics = {
@@ -1114,6 +1183,8 @@ class ModelTracer:
         self.events = utils.collect_events(self.trace_data)
         self.sequences = utils.link_sequences(self.events)
         print(f"Collected {len(self.sequences)} event sequences.")
+        self._compute_power_attribution()
+        self._write_power_attribution_files()
 
     def trace_forward_pass_for_whisper(self) -> None:
         """
@@ -1149,39 +1220,42 @@ class ModelTracer:
 
         # Profiled runs
         with torch.no_grad():
-            with profile(
-                activities=self._get_profiler_activities(),
-                with_modules=True,
-                with_flops=True,
-                profile_memory=True,
-                record_shapes=True,
-            ) as prof:
-                if self._has_cuda and self.num_gpus == 1:
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                else:
-                    self._sync_device()
-                    wall_start = time.perf_counter()
+            with power_profile_scope(self, self.args):
+                self._profile_mono_start_ns = time.monotonic_ns()
+                with profile(
+                    activities=self._get_profiler_activities(),
+                    with_modules=True,
+                    with_flops=True,
+                    profile_memory=True,
+                    record_shapes=True,
+                ) as prof:
+                    if self._has_cuda and self.num_gpus == 1:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record()
+                    else:
+                        self._sync_device()
+                        wall_start = time.perf_counter()
 
-                for _ in range(num_runs):
-                    self.model.generate(
-                        **self.model_inputs,
-                        max_new_tokens=self.max_new_tokens,
-                        do_sample=False,
-                    )
-                    self._sync_device()
+                    for _ in range(num_runs):
+                        self.model.generate(
+                            **self.model_inputs,
+                            max_new_tokens=self.max_new_tokens,
+                            do_sample=False,
+                        )
+                        self._sync_device()
 
-                if self._has_cuda and self.num_gpus == 1:
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    total_time_us = utils.ms_to_us(start_event.elapsed_time(end_event))
-                else:
-                    self._sync_device()
-                    wall_end = time.perf_counter()
-                    total_time_us = (wall_end - wall_start) * 1e6  # seconds -> µs
+                    if self._has_cuda and self.num_gpus == 1:
+                        end_event.record()
+                        torch.cuda.synchronize()
+                        total_time_us = utils.ms_to_us(start_event.elapsed_time(end_event))
+                    else:
+                        self._sync_device()
+                        wall_end = time.perf_counter()
+                        total_time_us = (wall_end - wall_start) * 1e6  # seconds -> µs
 
-                self.torch_measured_inference_time_us = total_time_us / num_runs
+                    self.torch_measured_inference_time_us = total_time_us / num_runs
+                self._profile_mono_end_ns = time.monotonic_ns()
 
         self.num_profiled_runs = num_runs
         print(f"Mean time per inference: {utils.us_to_ms(self.torch_measured_inference_time_us):.2f} ms")
@@ -1228,28 +1302,38 @@ class ModelTracer:
         # Profiled runs - run num_runs inferences within profiler
         # All runs are captured in a single trace; metrics are averaged by frequency
         with torch.no_grad():
-            with profile(
-                activities=self._get_profiler_activities(),
-                with_modules=True,
-                with_flops=True,
-                profile_memory=True,
-                record_shapes=True,
-            ) as prof:
-                if self._has_cuda and self.num_gpus == 1:
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                else:
-                    self._sync_device()
-                    wall_start = time.perf_counter()
+            with power_profile_scope(self, self.args):
+                self._profile_mono_start_ns = time.monotonic_ns()
+                with profile(
+                    activities=self._get_profiler_activities(),
+                    with_modules=True,
+                    with_flops=True,
+                    profile_memory=True,
+                    record_shapes=True,
+                ) as prof:
+                    if self._has_cuda and self.num_gpus == 1:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record()
+                    else:
+                        self._sync_device()
+                        wall_start = time.perf_counter()
 
-                _last_kv_output = None
-                for run_idx in range(num_runs):
-                    _is_last = (run_idx == num_runs - 1)
-                    # FIX: Use TE FP8 autocast if recipe is available
-                    if self.is_fp8 and getattr(self, 'fp8_recipe', None):
-                        import transformer_engine.pytorch as te
-                        with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
+                    _last_kv_output = None
+                    for run_idx in range(num_runs):
+                        _is_last = (run_idx == num_runs - 1)
+                        # FIX: Use TE FP8 autocast if recipe is available
+                        if self.is_fp8 and getattr(self, 'fp8_recipe', None):
+                            import transformer_engine.pytorch as te
+                            with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
+                                _out = self.model.generate(
+                                    **self.model_inputs,
+                                    max_new_tokens=self.max_new_tokens,
+                                    do_sample=False,
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                    return_dict_in_generate=_is_last,
+                                )
+                        else:
                             _out = self.model.generate(
                                 **self.model_inputs,
                                 max_new_tokens=self.max_new_tokens,
@@ -1257,31 +1341,24 @@ class ModelTracer:
                                 pad_token_id=self.tokenizer.pad_token_id,
                                 return_dict_in_generate=_is_last,
                             )
+                        if _is_last:
+                            _last_kv_output = _out
+                        del _out
+
+                        # Sync between runs to ensure clean measurements
+                        self._sync_device()
+
+                    if self._has_cuda and self.num_gpus == 1:
+                        end_event.record()
+                        torch.cuda.synchronize()
+                        total_time_us = utils.ms_to_us(start_event.elapsed_time(end_event))
                     else:
-                        _out = self.model.generate(
-                            **self.model_inputs,
-                            max_new_tokens=self.max_new_tokens,
-                            do_sample=False,
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            return_dict_in_generate=_is_last,
-                        )
-                    if _is_last:
-                        _last_kv_output = _out
-                    del _out
+                        self._sync_device()
+                        wall_end = time.perf_counter()
+                        total_time_us = (wall_end - wall_start) * 1e6  # seconds -> µs
 
-                    # Sync between runs to ensure clean measurements
-                    self._sync_device()
-
-                if self._has_cuda and self.num_gpus == 1:
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    total_time_us = utils.ms_to_us(start_event.elapsed_time(end_event))
-                else:
-                    self._sync_device()
-                    wall_end = time.perf_counter()
-                    total_time_us = (wall_end - wall_start) * 1e6  # seconds -> µs
-
-                self.torch_measured_inference_time_us = total_time_us / num_runs
+                    self.torch_measured_inference_time_us = total_time_us / num_runs
+                self._profile_mono_end_ns = time.monotonic_ns()
 
         # Store num_runs for downstream analysis
         self.num_profiled_runs = num_runs
@@ -1334,35 +1411,38 @@ class ModelTracer:
 
         # Profiled runs
         with torch.no_grad():
-            with profile(
-                activities=self._get_profiler_activities(),
-                with_modules=True,
-                with_flops=True,
-                profile_memory=True,
-                record_shapes=True,
-            ) as prof:
-                if self._has_cuda and self.num_gpus == 1:
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                else:
-                    self._sync_device()
-                    wall_start = time.perf_counter()
+            with power_profile_scope(self, self.args):
+                self._profile_mono_start_ns = time.monotonic_ns()
+                with profile(
+                    activities=self._get_profiler_activities(),
+                    with_modules=True,
+                    with_flops=True,
+                    profile_memory=True,
+                    record_shapes=True,
+                ) as prof:
+                    if self._has_cuda and self.num_gpus == 1:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        start_event.record()
+                    else:
+                        self._sync_device()
+                        wall_start = time.perf_counter()
 
-                for _ in range(num_runs):
-                    self.model(**self.model_inputs)
-                    self._sync_device()
+                    for _ in range(num_runs):
+                        self.model(**self.model_inputs)
+                        self._sync_device()
 
-                if self._has_cuda and self.num_gpus == 1:
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    total_time_us = utils.ms_to_us(start_event.elapsed_time(end_event))
-                else:
-                    self._sync_device()
-                    wall_end = time.perf_counter()
-                    total_time_us = (wall_end - wall_start) * 1e6  # seconds -> µs
+                    if self._has_cuda and self.num_gpus == 1:
+                        end_event.record()
+                        torch.cuda.synchronize()
+                        total_time_us = utils.ms_to_us(start_event.elapsed_time(end_event))
+                    else:
+                        self._sync_device()
+                        wall_end = time.perf_counter()
+                        total_time_us = (wall_end - wall_start) * 1e6  # seconds -> µs
 
-                self.torch_measured_inference_time_us = total_time_us / num_runs
+                    self.torch_measured_inference_time_us = total_time_us / num_runs
+                self._profile_mono_end_ns = time.monotonic_ns()
 
         self.num_profiled_runs = num_runs
         print(f"Mean time per inference: {utils.us_to_ms(self.torch_measured_inference_time_us):.2f} ms")

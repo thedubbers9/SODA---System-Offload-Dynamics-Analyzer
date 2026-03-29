@@ -848,6 +848,29 @@ def get_args_parser() -> argparse.ArgumentParser:
              "Values > available GPUs are clamped to available count.",
     )
     parser.add_argument(
+        "--no-power-sampling",
+        dest="no_power_sampling",
+        action="store_true",
+        default=False,
+        help="Disable NVML board-level power sampling during Stage 1 profiling.",
+    )
+    parser.add_argument(
+        "--power-interval-ms",
+        dest="power_interval_ms",
+        type=float,
+        default=5.0,
+        help="NVML polling interval in milliseconds during profiled inference "
+             "(smaller = finer granularity, more overhead). Default: 5.",
+    )
+    parser.add_argument(
+        "--power-export-kernel-instances",
+        dest="power_export_kernel_instances",
+        action="store_true",
+        default=False,
+        help="Write every kernel invocation's attributed energy to "
+             "power_kernel_instances.json (can be large for many --runs).",
+    )
+    parser.add_argument(
         "--no-global-cache",
         dest="no_global_cache",
         action="store_true",

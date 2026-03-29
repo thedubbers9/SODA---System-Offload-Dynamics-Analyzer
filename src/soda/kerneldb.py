@@ -241,6 +241,26 @@ def generate_kernel_database(
     total_unique = len(db_entries)
     lib_mediated_count = sum(1 for e in db_entries if e["classification"]["is_library_mediated"])
 
+    meta_extra: Dict[str, Any] = {}
+    pm = getattr(tracer, "power_metrics", None)
+    if isinstance(pm, dict) and pm.get("source") == "nvml":
+        meta_extra["power_nvml"] = {
+            "interval_ms": pm.get("interval_ms"),
+            "window_duration_ms": pm.get("window_duration_ms"),
+            "sample_count": pm.get("sample_count"),
+            "total_estimated_energy_mj_trapezoid_sum_devices": pm.get(
+                "total_estimated_energy_mj_trapezoid_sum_devices"
+            ),
+            "per_device": pm.get("per_device"),
+        }
+        attr = pm.get("attribution")
+        if isinstance(attr, dict) and attr.get("available"):
+            tot = attr.get("totals") or {}
+            meta_extra["power_nvml"]["attribution_totals_mj"] = {
+                "all_kernel_instances": tot.get("attributed_energy_all_kernel_instances_mj"),
+                "per_profiled_run": tot.get("attributed_energy_per_profiled_run_mj"),
+            }
+
     database = {
         "version": "1.0",
         "metadata": {
@@ -256,6 +276,7 @@ def generate_kernel_database(
             "timestamp": datetime.now().isoformat(),
             "num_profiled_runs": num_runs,
             "last_run_sequences": len(last_run_seqs),
+            **meta_extra,
         },
         "summary": {
             "total_unique_kernels": total_unique,
