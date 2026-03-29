@@ -145,6 +145,11 @@ class MoEProfilePipeline:
         cfg = meta.get("config", meta)
         precision = cfg.get("precision", "bfloat16") or "bfloat16"
         debug_print("op_profile:start", "precision=", precision)
+        print(
+            "[MoE Profile] Building trace-ordered execution rows (parse trace → per-GPU op_profile) — "
+            "large traces can take several minutes…",
+            flush=True,
+        )
         profile = generate_op_profile(
             trace_path=self.trace_path,
             classified_kernels=classified,

@@ -45,6 +45,26 @@ def test_dram_metric_classification_variants():
     assert w is not None and "write" in w.lower()
 
 
+def test_dram_metric_classification_gb20x_gpu_memory_labels():
+    """Nsight GB20x configs often expose throughput as GPU Memory R/W, not 'Device … DRAM'."""
+    names = [
+        "Foo",
+        "GPU Memory Read Throughput",
+        "GPU Memory Write Throughput",
+    ]
+    r, w, sem = classify_dram_bandwidth_metrics(names)
+    assert r == "GPU Memory Read Throughput"
+    assert w == "GPU Memory Write Throughput"
+
+
+def test_dram_metric_classification_nsys2025_throughput_suffix():
+    """SQLite export uses TARGET_INFO_GPU_METRICS names like 'DRAM Read Bandwidth [Throughput %]'."""
+    names = ["GPC Clock Frequency [MHz]", "DRAM Read Bandwidth [Throughput %]", "DRAM Write Bandwidth [Throughput %]"]
+    r, w, _sem = classify_dram_bandwidth_metrics(names)
+    assert r == "DRAM Read Bandwidth [Throughput %]"
+    assert w == "DRAM Write Bandwidth [Throughput %]"
+
+
 def test_samples_to_byte_windows_and_conservation():
     by_name = {
         "DRAM Read Bandwidth": [(0, 100.0), (1_000_000, 100.0)],
@@ -157,7 +177,41 @@ def test_end_to_end_sqlite_and_trace(tmp_path: Path):
 
 
 def test_distribute_trace_unassigned(tmp_path: Path):
-    """No SODA GPU event overlaps Nsight interval -> trace_unassigned holds bytes."""
+    """Bytes on Nsight intervals that do not overlap any trace GPU span -> trace_unassigned."""
+    intervals = [
+        {
+            "start_ns": 0,
+            "end_ns": 1000,
+            "name": "empty",
+            "correlation": None,
+            "nsys_hbm_estimated_read_bytes": 0.0,
+            "nsys_hbm_estimated_write_bytes": 0.0,
+            "nsys_hbm_estimated_total_bytes": 0.0,
+            "nsys_hbm_attribution_method": "sample_overlap",
+            "nsys_hbm_metric_source": "nsight_systems_gpu_metrics",
+        },
+        {
+            "start_ns": 1_000_000_000_000,
+            "end_ns": 1_000_000_001_000,
+            "name": "far",
+            "correlation": None,
+            "nsys_hbm_estimated_read_bytes": 50.0,
+            "nsys_hbm_estimated_write_bytes": 0.0,
+            "nsys_hbm_estimated_total_bytes": 50.0,
+            "nsys_hbm_attribution_method": "sample_overlap",
+            "nsys_hbm_metric_source": "nsight_systems_gpu_metrics",
+        },
+    ]
+    soda = [
+        {"ts_us": 0.0, "dur_us": 1.0, "name": "early", "correlation": None},
+    ]
+    match, ur, uw, ut, _, *_ = distribute_interval_bytes_to_soda_events(intervals, soda)
+    assert ut > 0
+    assert match[0]["nsys_hbm_match_status"] == "unmatched"
+
+
+def test_distribute_min_start_alignment_when_no_correlation():
+    """Without correlation IDs, offset 0 leaves timelines disjoint; min-start aligns them."""
     intervals = [
         {
             "start_ns": 0,
@@ -174,6 +228,7 @@ def test_distribute_trace_unassigned(tmp_path: Path):
     soda = [
         {"ts_us": 1_000_000.0, "dur_us": 1.0, "name": "late", "correlation": None},
     ]
-    match, ur, uw, ut, _ = distribute_interval_bytes_to_soda_events(intervals, soda)
-    assert ut > 0
-    assert match[0]["nsys_hbm_match_status"] == "unmatched"
+    match, ur, uw, ut, _, *_ = distribute_interval_bytes_to_soda_events(intervals, soda)
+    assert match[0]["nsys_hbm_match_status"] == "matched"
+    assert float(match[0]["nsys_hbm_estimated_total_bytes"] or 0) > 0
+    assert ut == 0.0

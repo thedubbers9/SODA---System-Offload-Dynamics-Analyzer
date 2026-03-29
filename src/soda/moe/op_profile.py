@@ -420,9 +420,9 @@ def _iter_gpu_events_ordered(trace: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if isinstance(ak, str) and ak.startswith("nsys_hbm_"):
                     mrec[ak] = av
             out.append(mrec)
-            if len(out) % 50000 == 0 and len(out) > 0:
-                debug_print("iter_gpu_events:progress", "gpu_events=", len(out))
-            debug_print("iter_gpu_events:done", "gpu_events=", len(out))
+        if len(out) % 50000 == 0 and len(out) > 0:
+            debug_print("iter_gpu_events:progress", "gpu_events=", len(out))
+    debug_print("iter_gpu_events:done", "gpu_events=", len(out))
     return out
 
 
@@ -1250,9 +1250,19 @@ def build_execution_trace(
         "num_layers=", num_layers,
     )
     trace_path = Path(trace_path)
+    t_sz = trace_path.stat().st_size
+    print(
+        f"[MoE Profile] Reading trace.json ({t_sz / (1024**3):.2f} GiB) — json.load (may take minutes)…",
+        flush=True,
+    )
     with open(trace_path, "r", encoding="utf-8") as f:
         debug_print("build_execution_trace:loading_trace", trace_path)
         trace = json.load(f)
+    n_te = len(trace.get("traceEvents") or [])
+    print(
+        f"[MoE Profile] Trace in memory: {n_te:,} Chrome events — parsing ATen / launches / GPU rows…",
+        flush=True,
+    )
     debug_print("build_execution_trace:trace_loaded")
 
     aten_ordered, aten_by_ext_id, launches_by_corr = _parse_trace_ordered(trace)
@@ -1273,6 +1283,10 @@ def build_execution_trace(
 
     layer_starts = _compute_layer_boundaries(aten_ordered, num_layers)
     debug_print("layer_boundaries", layer_starts)
+    print(
+        f"[MoE Profile] Building execution rows: {len(gpu_events):,} GPU events × layers/ATen attach…",
+        flush=True,
+    )
 
     rows: List[Dict[str, Any]] = [None] * len(gpu_events)  # type: ignore[list-item]
     # Streaming parent-ATen attach: assumes GPU timestamps are usually non-decreasing.
@@ -1280,7 +1294,13 @@ def build_execution_trace(
     aten_i = 0
     active_aten: List[int] = []
     last_gpu_ts: Optional[float] = None
+    _ngpu = len(gpu_events)
     for exec_index, ev in enumerate(gpu_events):
+        if exec_index > 0 and exec_index % 200_000 == 0:
+            print(
+                f"[MoE Profile] execution rows progress: {exec_index:,}/{_ngpu:,} GPU events…",
+                flush=True,
+            )
         if exec_index % 500 == 0:
             debug_print("build_execution_trace:progress", "exec_index=", exec_index, "total=", len(gpu_events))
         corr = ev.get("correlation")
@@ -1353,6 +1373,7 @@ def build_execution_trace(
             structural_role = "unknown"
             op_family = "unknown_non_gemm"
             src_entry_id = None
+            cleaned = clean_kernel_name(ev["name"]) if ev["kind"] == "gpu_kernel" else ""
             if exec_index % 10000 == 0:
                 debug_print("build_execution_trace:no_parent", "exec_index=", exec_index, "gpu_name=", ev.get("name"))
         else:
@@ -1490,6 +1511,10 @@ def build_execution_trace(
         "rows=", len(rows),
         "kernels=", sum(1 for r in rows if r and r.get("kind") == "gpu_kernel"),
         "memcpy=", sum(1 for r in rows if r and r.get("kind") == "gpu_memcpy"),
+    )
+    print(
+        f"[MoE Profile] Execution rows complete: {len(rows):,} rows — routed-expert relabel pass…",
+        flush=True,
     )
     relabeled = _routed_expert_context_relabel(rows, window=8)
     debug_print(

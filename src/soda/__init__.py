@@ -84,7 +84,12 @@ class SodaAnalyzer:
             - sequences: Event sequences
             - avg_kernel_dur: Average kernel duration results
         """
-        print("=== Analyzing Trace Data ===")
+        print("=== Analyzing Trace Data ===", flush=True)
+        print(
+            f"Computing metrics from {len(self.sequences):,} linked sequences "
+            f"(streams, kernel stats, taxes — can take a while on huge traces)…",
+            flush=True,
+        )
         print(f"Analyzing {len(self.sequences)} event sequences")
         sequences = utils.calculate_sequence_metrics(list(self.sequences), metrics=["T_launch", "T_dispatch", "T_Py"])
         
@@ -1138,7 +1143,11 @@ class ModelTracer:
         self.model = None
         self.tokenizer = None
         self.model_inputs = None
-        self.trace_data = utils.load_json(self.trace_file)
+        self.trace_data = utils.load_json(self.trace_file, label="trace")
+        print(
+            "Reconstructing event index from trace (next: collect_events → link_sequences)…",
+            flush=True,
+        )
         self._model_memory_bytes = 0
         self._model_memory_reserved_bytes = 0
         self._pre_inference_bytes = 0
@@ -1189,9 +1198,19 @@ class ModelTracer:
         """
         Parses the trace to collect events and build linked event sequences.
         """
+        print("Parsing Chrome trace events (collect_events)…", flush=True)
         self.events = utils.collect_events(self.trace_data)
+        ce = self.events
+        print(
+            f"  Indexed: {len(ce['gpu']['kernels']):,} GPU kernels, "
+            f"{len(ce['gpu']['memory']):,} memcpy/memset, "
+            f"{len(ce['cpu']['aten_ops']):,} ATen ops, "
+            f"{len(ce['cpu']['launches']):,} CUDA launch rows",
+            flush=True,
+        )
+        print("Linking kernels to CUDA launches and ATen ops…", flush=True)
         self.sequences = utils.link_sequences(self.events)
-        print(f"Collected {len(self.sequences)} event sequences.")
+        print(f"Collected {len(self.sequences):,} event sequences.", flush=True)
 
     def trace_forward_pass_for_whisper(self) -> None:
         """
@@ -1553,6 +1572,11 @@ def main() -> int:
             print(f"=== Nsight HBM attribution written under {nsys_sub} ===")
 
             print(f"Loading analysis from: {exp_dir.resolve()}")
+            print(
+                "  Next steps: load trace.json → collect_events → link_sequences → report "
+                "(large traces: several minutes with no GPU activity)…",
+                flush=True,
+            )
             tracer = ModelTracer.from_completed_profile(args=args, output_dir=exp_dir)
 
             if args.microbench:

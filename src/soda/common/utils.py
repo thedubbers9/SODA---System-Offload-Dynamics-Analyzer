@@ -7,6 +7,7 @@ import bisect
 import json
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
 import re
 import copy
 import torch
@@ -412,24 +413,56 @@ def remove_file(file_path: str | Path) -> None:
     """
     Path(file_path).unlink(missing_ok=True)
 
-def load_json(file_path: str | Path) -> Dict[str, Any]:
+def load_json(file_path: str | Path, *, label: str = "") -> Dict[str, Any]:
     """
     Load JSON file.
-    
+
+    Uses ``orjson`` when available (often 2–10× faster on multi‑MB traces).
+    For large files, prints a short notice so long parses do not look hung.
+
     Args:
         file_path: Path to JSON file (str or Path object).
-    
+        label: Optional description for progress text (e.g. ``"trace"``).
+
     Returns:
         Dictionary loaded from JSON file.
-    
+
     Raises:
         FileNotFoundError: If file does not exist.
     """
     file_path = Path(file_path)
     ensure_file(file_path)
-    
-    with open(file_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    nbytes = file_path.stat().st_size
+    tag = f" ({label})" if label else ""
+    if nbytes > 50_000_000:
+        print(
+            f"Loading JSON{tag}: {file_path.name} ({nbytes / (1024**3):.2f} GiB) — "
+            "large traces can take several minutes…",
+            flush=True,
+        )
+    elif nbytes > 5_000_000:
+        print(
+            f"Loading JSON{tag}: {file_path.name} ({nbytes / (1024**2):.1f} MiB)…",
+            flush=True,
+        )
+
+    try:
+        import orjson  # type: ignore[import-not-found]
+
+        raw = file_path.read_bytes()
+        data = orjson.loads(raw)
+    except Exception:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    if nbytes > 1_000_000:
+        te = len(data.get("traceEvents") or [])
+        print(
+            f"  JSON load complete: {te:,} traceEvents in {file_path.name} "
+            f"({nbytes / (1024**2):.1f} MiB on disk)",
+            flush=True,
+        )
+    return data
 
 def save_json(file_path: str | Path, data: Dict[str, Any], indent: int = 2) -> None:
     """
@@ -1219,8 +1252,19 @@ def collect_events(trace: Dict[str, Any]) -> Dict[str, Any]:
     cuda_launch_events_by_corr = {}
     kernel_events = []
     gpu_mem_events = []
-    
-    for event in trace["traceEvents"]:
+
+    trace_events = trace.get("traceEvents") or []
+    n_te = len(trace_events)
+    _ce_log_every = 500_000
+    _ce_next = _ce_log_every
+
+    for ei, event in enumerate(trace_events):
+        if n_te >= _ce_log_every and ei >= _ce_next:
+            print(
+                f"  collect_events: scanned {ei:,}/{n_te:,} Chrome events…",
+                flush=True,
+            )
+            _ce_next += _ce_log_every
         # Skip non-complete events
         if event.get("ph") != "X":
             continue
@@ -1311,7 +1355,10 @@ def collect_events(trace: Dict[str, Any]) -> Dict[str, Any]:
                         "dur": event.get("dur", 0),
                         "external_id": ext_id,
                     }
-    
+
+    if n_te >= _ce_log_every:
+        print(f"  collect_events: finished scanning {n_te:,} Chrome events", flush=True)
+
     # Create hierarchical structure
     events = {
         "cpu": {
@@ -1328,10 +1375,144 @@ def collect_events(trace: Dict[str, Any]) -> Dict[str, Any]:
     return events
 
 
+# Cap backward scan over ATen ops (nested stacks are rarely deeper than this).
+_ATEN_TS_MAX_BACKWARD = 256
+_TORCH_OP_MAX_BACKWARD = 128
+
+
+def _aten_op_containing_ts(
+    sorted_atens: List[Dict[str, Any]],
+    aten_starts: List[float],
+    ts: float,
+    *,
+    max_backward: int = _ATEN_TS_MAX_BACKWARD,
+) -> Optional[Dict[str, Any]]:
+    """
+    Return an ATen op whose Chrome interval [ts_start, ts_end) contains ``ts``.
+
+    ``aten_starts`` must be the ``ts`` column of ``sorted_atens`` (precomputed once).
+    Scans backward from the latest op with start <= ``ts`` until a containing
+    interval is found (handles overlapping ATen ranges).
+    """
+    if not sorted_atens or not aten_starts:
+        return None
+    i = bisect.bisect_right(aten_starts, ts) - 1
+    steps = 0
+    while i >= 0 and steps < max_backward:
+        a = sorted_atens[i]
+        t0 = float(a["ts"])
+        t1 = t0 + float(a.get("dur") or 0)
+        if t0 <= ts < t1:
+            return a
+        i -= 1
+        steps += 1
+    return None
+
+
+def _link_sequences_impl(
+    kernel_events: List[Dict[str, Any]],
+    cuda_launches: Dict[int, Any],
+    aten_ops: Dict[int, Any],
+    torch_ops: Dict[int, Any],
+    sorted_atens: List[Dict[str, Any]],
+    aten_starts: List[float],
+    sorted_tops: List[Dict[str, Any]],
+    sorted_starts: List[float],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    sequences: List[Dict[str, Any]] = []
+    orphan_kernels: List[Dict[str, Any]] = []
+
+    for kernel in kernel_events:
+        corr = kernel.get("correlation")
+        ext_id = kernel.get("external_id")
+        cuda_launch = cuda_launches.get(corr) if corr is not None else None
+        if ext_id is None and cuda_launch is not None:
+            ext_id = cuda_launch.get("external_id")
+        aten_op = aten_ops.get(ext_id) if ext_id is not None else None
+        if aten_op is None:
+            aten_op = _aten_op_containing_ts(
+                sorted_atens, aten_starts, float(kernel.get("ts") or 0)
+            )
+            if aten_op is not None and ext_id is None:
+                ext_id = aten_op.get("external_id")
+
+        torch_op = torch_ops.get(ext_id) if ext_id is not None else None
+
+        if torch_op is None and aten_op is not None:
+            aten_ts = aten_op["ts"]
+            idx = bisect.bisect_right(sorted_starts, aten_ts) - 1
+            n_back = 0
+            while idx >= 0 and n_back < _TORCH_OP_MAX_BACKWARD:
+                candidate = sorted_tops[idx]
+                t_end = candidate["ts"] + candidate.get("dur", 0)
+                if t_end >= aten_ts:
+                    torch_op = candidate
+                    break
+                idx -= 1
+                n_back += 1
+
+        if cuda_launch and aten_op:
+            sequences.append(
+                {
+                    "kernel": kernel,
+                    "cuda_launch": cuda_launch,
+                    "aten_op": aten_op,
+                    "torch_op": torch_op,
+                }
+            )
+        else:
+            orphan_kernels.append(kernel)
+
+    return sequences, orphan_kernels
+
+
+# Process-pool workers (module-level for pickling on spawn/fork).
+_LS_WK_CUDA: Any = None
+_LS_WK_ATEN: Any = None
+_LS_WK_TORCH_OPS: Any = None
+_LS_WK_SORTED_ATENS: Any = None
+_LS_WK_ATEN_STARTS: Any = None
+_LS_WK_SORTED_TOPS: Any = None
+_LS_WK_SORTED_STARTS: Any = None
+
+
+def _link_seq_pool_init(
+    cuda_launches: Dict[int, Any],
+    aten_ops: Dict[int, Any],
+    torch_ops: Dict[int, Any],
+    sorted_atens: List[Dict[str, Any]],
+    aten_starts: List[float],
+    sorted_tops: List[Dict[str, Any]],
+    sorted_starts: List[float],
+) -> None:
+    global _LS_WK_CUDA, _LS_WK_ATEN, _LS_WK_TORCH_OPS
+    global _LS_WK_SORTED_ATENS, _LS_WK_ATEN_STARTS, _LS_WK_SORTED_TOPS, _LS_WK_SORTED_STARTS
+    _LS_WK_CUDA = cuda_launches
+    _LS_WK_ATEN = aten_ops
+    _LS_WK_TORCH_OPS = torch_ops
+    _LS_WK_SORTED_ATENS = sorted_atens
+    _LS_WK_ATEN_STARTS = aten_starts
+    _LS_WK_SORTED_TOPS = sorted_tops
+    _LS_WK_SORTED_STARTS = sorted_starts
+
+
+def _link_seq_pool_run(chunk: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    return _link_sequences_impl(
+        chunk,
+        _LS_WK_CUDA,
+        _LS_WK_ATEN,
+        _LS_WK_TORCH_OPS,
+        _LS_WK_SORTED_ATENS,
+        _LS_WK_ATEN_STARTS,
+        _LS_WK_SORTED_TOPS,
+        _LS_WK_SORTED_STARTS,
+    )
+
+
 def link_sequences(events: Dict[str, Any]) -> List[Dict]:
     """
     Get event sequences linking CPU operations, CUDA launches, and kernels.
-    
+
     Args:
         events: Dictionary with hierarchical structure from collect_events.
 
@@ -1343,52 +1524,71 @@ def link_sequences(events: Dict[str, Any]) -> List[Dict]:
     cuda_launches = events["cpu"]["launches"]
     kernel_events = events["gpu"]["kernels"]
 
-    sequences = []
-    orphan_kernels = []
-
-    # Pre-build a time-sorted list of torch_ops for O(log n) fallback lookup.
-    # When a kernel has no direct external_id match we binary-search for the
-    # most-recent torch_op whose interval [ts, ts+dur) encloses the ATen ts.
     _sorted_tops = sorted(torch_ops.values(), key=lambda o: o["ts"])
     _sorted_starts = [o["ts"] for o in _sorted_tops]
+    _sorted_atens = sorted(aten_ops.values(), key=lambda o: o["ts"])
+    aten_starts = [float(a["ts"]) for a in _sorted_atens]
 
-    for kernel in kernel_events:
-        corr = kernel.get("correlation")
-        ext_id = kernel.get("external_id")
-        
-        cuda_launch = cuda_launches.get(corr)
-        aten_op = aten_ops.get(ext_id)
-        
-        # Try to find torch_op by external_id
-        torch_op = torch_ops.get(ext_id)
-        
-        # If no direct match, binary-search for the enclosing torch_op by timestamp.
-        # O(log n + k) vs the previous O(n) linear scan, where k is the number of
-        # candidate ops that started before aten_ts but ended before it (typically 0).
-        if torch_op is None and aten_op is not None:
-            aten_ts = aten_op["ts"]
-            idx = bisect.bisect_right(_sorted_starts, aten_ts) - 1
-            while idx >= 0:
-                candidate = _sorted_tops[idx]
-                t_end = candidate["ts"] + candidate.get("dur", 0)
-                if t_end >= aten_ts:
-                    torch_op = candidate
-                    break
-                idx -= 1  # candidate ended before aten_ts; try earlier (longer-duration) ops
-        
-        if cuda_launch and aten_op:
-            sequences.append({
-                "kernel": kernel,
-                "cuda_launch": cuda_launch,
-                "aten_op": aten_op,
-                "torch_op": torch_op,  # May still be None
-            })
-        else:
-            orphan_kernels.append(kernel)
+    n_k = len(kernel_events)
+    cpu_n = os.cpu_count() or 8
+    max_workers = max(1, (cpu_n * 2) // 3)
+    # Enough work per process to amortize spawn/pickle; cap workers for memory.
+    min_kernels_per_worker = 25_000
+    use_parallel = (
+        n_k >= 80_000
+        and max_workers >= 2
+        and n_k >= min_kernels_per_worker * 2
+    )
 
-    # Log orphan count but don't fail
+    if use_parallel:
+        n_workers = min(max_workers, max(2, n_k // min_kernels_per_worker))
+        chunk_size = (n_k + n_workers - 1) // n_workers
+        chunks = [kernel_events[i : i + chunk_size] for i in range(0, n_k, chunk_size)]
+        print(
+            f"Linking {n_k:,} kernels to CUDA/ATen ({n_workers} worker processes, "
+            f"≤{max_workers} of ~{cpu_n} CPUs)…",
+            flush=True,
+        )
+        sequences: List[Dict[str, Any]] = []
+        orphan_kernels: List[Dict[str, Any]] = []
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_link_seq_pool_init,
+            initargs=(
+                cuda_launches,
+                aten_ops,
+                torch_ops,
+                _sorted_atens,
+                aten_starts,
+                _sorted_tops,
+                _sorted_starts,
+            ),
+        ) as ex:
+            for seq_part, orp_part in ex.map(_link_seq_pool_run, chunks):
+                sequences.extend(seq_part)
+                orphan_kernels.extend(orp_part)
+    else:
+        sequences, orphan_kernels = _link_sequences_impl(
+            kernel_events,
+            cuda_launches,
+            aten_ops,
+            torch_ops,
+            _sorted_atens,
+            aten_starts,
+            _sorted_tops,
+            _sorted_starts,
+        )
+
+    print(
+        f"  link_sequences: {len(sequences):,} linked sequences, "
+        f"{len(orphan_kernels):,} orphan kernels",
+        flush=True,
+    )
     if orphan_kernels:
-        print(f"Warning: {len(orphan_kernels)} orphan kernels (missing aten/launch events)")
+        print(
+            f"Warning: {len(orphan_kernels)} orphan kernels (missing aten/launch events)",
+            flush=True,
+        )
 
     return sequences
 
