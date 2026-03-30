@@ -45,11 +45,11 @@ export ENV_METADATA="env_metadata.json"
 export EXPERIMENT_DIR=""
 
 # HuggingFace cache (set default if not already set)
-# export HF_HOME="${HF_HOME:-/tmp/hf_cache_$USER}"
-export HF_HOME="/scratch/$USER/hf_cache"
+# export HF_HOME="${HF_HOME:-/tmp/hf_cache_${USER:-$(id -un)}}"
+export HF_HOME="/scratch/${USER:-$(id -un)}/hf_cache"
 
-# Python path setup for imports
-export PYTHONPATH="$SODA_SRC:$PYTHONPATH"
+# Python path setup for imports (safe when PYTHONPATH is unset under set -u)
+export PYTHONPATH="$SODA_SRC:${PYTHONPATH:-}"
 
 # ============================================================
 # Microbench paths
@@ -94,12 +94,12 @@ export ASSERT_LOG="microbench/assert.log"
 
 # Helper function to activate Python environment (supports conda or venv)
 activate_env() {
-    if [ -n "$CONDA_DEFAULT_ENV" ] && [ "$CONDA_DEFAULT_ENV" != "base" ]; then
-        echo "Using conda environment: $CONDA_DEFAULT_ENV"
+    if [ -n "${CONDA_DEFAULT_ENV:-}" ] && [ "${CONDA_DEFAULT_ENV:-}" != "base" ]; then
+        echo "Using conda environment: ${CONDA_DEFAULT_ENV:-}"
     elif [ -d "$PYTHON_VENV" ]; then
         echo "Activating venv at $PYTHON_VENV"
         source "$PYTHON_VENV/bin/activate"
-    elif [ -n "$CONDA_DEFAULT_ENV" ]; then
+    elif [ -n "${CONDA_DEFAULT_ENV:-}" ]; then
         echo "Using conda base environment"
     else
         echo "Warning: No virtual environment found. Using system Python."
