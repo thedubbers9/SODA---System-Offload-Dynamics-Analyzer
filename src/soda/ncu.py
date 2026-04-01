@@ -206,7 +206,18 @@ def parse_ncu_csv(csv_path: Path) -> List[Dict[str, Any]]:
         key = (launch_id, kernel)
 
         if key not in launches:
-            launches[key] = {"kernel_name": kernel, "metrics": {}}
+            launches[key] = {"kernel_name": kernel, "metrics": {}, "grid_size": [1, 1, 1]}
+
+        # Extract Grid Size (same for all metric rows of a launch; parse once).
+        if launches[key]["grid_size"] == [1, 1, 1]:
+            grid_str = row.get("Grid Size", "")
+            if grid_str:
+                nums = [int(x) for x in re.findall(r"\d+", grid_str)]
+                if nums:
+                    # Pad to 3D if fewer dims reported.
+                    while len(nums) < 3:
+                        nums.append(1)
+                    launches[key]["grid_size"] = nums[:3]
 
         metric_name = row.get("Metric Name", "")
         metric_value = row.get("Metric Value", "")
@@ -434,9 +445,12 @@ def ncu_profile_kernel(
 
     # Select the best launch — either by DRAM reads (pick_best_kernel) or first.
     if pick_best_kernel and len(launches) > 1:
-        ncu_metrics = _pick_best_launch(launches)["metrics"]
+        best_launch = _pick_best_launch(launches)
     else:
-        ncu_metrics = launches[0]["metrics"]
+        best_launch = launches[0]
+
+    ncu_metrics = best_launch["metrics"]
+    ncu_grid_size = best_launch.get("grid_size", [1, 1, 1])
 
     result = {
         "kernel_id": kernel_id,
@@ -444,6 +458,7 @@ def ncu_profile_kernel(
         "aten_op": op_name,
         "metrics": ncu_metrics,
         "replay_method": "pytorch",
+        "grid_size": ncu_grid_size,
     }
 
     # Pretty-print key metrics

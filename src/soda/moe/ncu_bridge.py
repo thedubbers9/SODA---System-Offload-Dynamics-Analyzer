@@ -233,12 +233,19 @@ def run_ncu_on_profiler_events(
         )
         l2_bytes = _safe_float(metrics.get("lts__t_bytes.sum", 0.0))
 
+        # Compute CTA count from the kernel's grid dimensions.
+        grid_size = ncu_result.get("grid_size", [1, 1, 1])
+        cta_count = 1
+        for dim in grid_size:
+            cta_count *= int(dim) if dim else 1
+
         results[key] = {
             "hbm_read_bytes": hbm_read,
             "hbm_write_bytes": hbm_write,
             "hbm_bytes": hbm_read + hbm_write,
             "l2_bytes": l2_bytes,
             "ncu_entry_id": entry_id,
+            "cta_count": cta_count,
         }
 
     print(
@@ -283,6 +290,16 @@ def merge_ncu_into_events(
         evt["hbm_write_bytes"] = ncu["hbm_write_bytes"]
         evt["l2_bytes"] = ncu["l2_bytes"]
         evt["hbm_source"] = "ncu"
+        # Stamp num_kernels from the NCU grid CTA count so that
+        # generate_op_profile_from_cupti produces a non-zero cta_count.
+        # On Blackwell/RTX 6000 the PyTorch profiler tree does not expose
+        # CUDA kernel children, leaving num_kernels=0.  NCU confirms the
+        # kernel ran and gives us its actual grid dimensions.
+        ncu_cta = ncu.get("cta_count", 0)
+        if ncu_cta > 0:
+            evt["num_kernels"] = ncu_cta
+        elif evt.get("num_kernels", 0) == 0:
+            evt["num_kernels"] = 1  # fallback: NCU confirmed kernel ran
         hit += 1
 
     print(f"[ncu_bridge] Merged NCU results into {hit}/{len(events)} events.")
