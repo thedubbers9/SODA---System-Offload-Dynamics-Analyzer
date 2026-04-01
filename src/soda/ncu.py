@@ -264,7 +264,7 @@ except Exception as exc:
 # warms L2 (torch.randn writes to DRAM, data stays in L2), causing the
 # first GEMM launch to read weights from L2 instead of DRAM — producing
 # near-zero dram__bytes_read.sum.
-_flush_size = 64 * 1024 * 1024  # 64 MB > H200 L2 (50 MB)
+_flush_size = 128 * 1024 * 1024  # 128 MB > Blackwell L2 (96 MB); H200 L2 is 50 MB
 _flush_buf = torch.empty(_flush_size, dtype=torch.uint8, device="cuda")
 torch.sum(_flush_buf)
 torch.cuda.synchronize()
@@ -295,24 +295,45 @@ if _fail_count == total:
 
 
 def _pick_best_launch(launches: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return the launch with the highest ``dram__bytes_read.sum``.
+    """Return the compute kernel launch with the highest DRAM read bytes.
 
     Used by ``ncu_profile_kernel(pick_best_kernel=True)`` to select the
     actual compute kernel from a set of captures that may include
-    cuBLASLt workspace/init kernels, bias-add epilogues, or other
-    short helper kernels with negligible DRAM traffic.
+    cuBLASLt workspace/init kernels, bias-add epilogues, L2 flush
+    kernels, or other overhead kernels.
 
-    Falls back to the first launch if all DRAM read values are zero.
+    Overhead kernels that should be excluded:
+    - ``distribution_elementwise_grid_stride_kernel``: random tensor init
+    - ``unrolled_elementwise_kernel``: elementwise copies (e.g. L2 flush)
+    - ``reduce_kernel``: reductions (e.g. torch.sum for L2 flush)
+
+    Falls back to the first launch if no compute kernels are found.
     """
+    _OVERHEAD_KERNEL_SUBSTRINGS = (
+        "distribution_elementwise_grid_stride_kernel",
+        "unrolled_elementwise_kernel",
+        "reduce_kernel",
+    )
+
+    def _is_overhead(launch: Dict[str, Any]) -> bool:
+        name = launch.get("kernel_name", "")
+        return any(s in name for s in _OVERHEAD_KERNEL_SUBSTRINGS)
+
     def _dram_reads(launch: Dict[str, Any]) -> float:
-        val = launch.get("metrics", {}).get("dram__bytes_read.sum", 0)
+        m = launch.get("metrics", {})
+        # Try Blackwell name first (.sum suffix), then pre-Blackwell name
+        val = m.get("dram__bytes_op_read.sum") or m.get("dram__bytes_read.sum", 0)
         try:
             return float(val or 0)
         except (TypeError, ValueError):
             return 0.0
 
-    best = max(launches, key=_dram_reads)
-    return best if _dram_reads(best) > 0 else launches[0]
+    # Prefer compute kernels; fall back to all launches if none found.
+    compute_launches = [l for l in launches if not _is_overhead(l)]
+    candidates = compute_launches if compute_launches else launches
+
+    best = max(candidates, key=_dram_reads)
+    return best if _dram_reads(best) > 0 else candidates[0]
 
 
 def ncu_profile_kernel(

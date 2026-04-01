@@ -37,9 +37,18 @@ from typing import Any, Dict, List, Optional, Tuple
 # Metrics needed for HBM + L2 byte counts (totals, not rates).
 # Phase 2 NCU_METRICS only has lts__t_bytes.sum.per_second (a rate);
 # the bridge needs the absolute-byte variants so hbm/l2 accounting is correct.
+#
+# Metric name changes across GPU generations:
+#   Pre-Blackwell (Ampere/Hopper):  dram__bytes_read.sum, dram__bytes_write.sum
+#   Blackwell (CC 12.x):            dram__bytes_op_read.sum, dram__bytes_op_write.sum
+# Both sets are collected so the same code works on all generations.
+# Note: requesting "dram__bytes_op_read" (without suffix) causes NCU to emit
+# dram__bytes_op_read.{avg,max,min,sum} rows; the ".sum" suffix variant is needed.
 _BRIDGE_NCU_METRICS = [
-    "dram__bytes_read.sum",
-    "dram__bytes_write.sum",
+    "dram__bytes_read.sum",       # pre-Blackwell (Ampere/Hopper)
+    "dram__bytes_write.sum",      # pre-Blackwell (Ampere/Hopper)
+    "dram__bytes_op_read.sum",    # Blackwell CC 12.x+
+    "dram__bytes_op_write.sum",   # Blackwell CC 12.x+
     "lts__t_bytes.sum",
 ]
 
@@ -203,9 +212,26 @@ def run_ncu_on_profiler_events(
             continue
 
         metrics = ncu_result.get("metrics", {})
-        hbm_read = float(metrics.get("dram__bytes_read.sum", 0.0) or 0.0)
-        hbm_write = float(metrics.get("dram__bytes_write.sum", 0.0) or 0.0)
-        l2_bytes = float(metrics.get("lts__t_bytes.sum", 0.0) or 0.0)
+
+        def _safe_float(val) -> float:
+            """Convert metric value to float, returning 0.0 for 'n/a' or None."""
+            try:
+                return float(val or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # Try Blackwell metric names first (dram__bytes_op_read.sum), then fall
+        # back to pre-Blackwell names (dram__bytes_read.sum).  On Blackwell the
+        # old counter name was renamed so '.sum' on the old name returns 'n/a'.
+        hbm_read = _safe_float(
+            metrics.get("dram__bytes_op_read.sum")
+            or metrics.get("dram__bytes_read.sum")
+        )
+        hbm_write = _safe_float(
+            metrics.get("dram__bytes_op_write.sum")
+            or metrics.get("dram__bytes_write.sum")
+        )
+        l2_bytes = _safe_float(metrics.get("lts__t_bytes.sum", 0.0))
 
         results[key] = {
             "hbm_read_bytes": hbm_read,
