@@ -895,8 +895,8 @@ def get_args_parser() -> argparse.ArgumentParser:
         "--moe-warmup",
         dest="moe_warmup",
         type=int,
-        default=2,
-        help="Number of warmup iterations before CUPTI profiling (default: 2).",
+        default=0,
+        help="Number of warmup iterations before CUPTI profiling (default: 0).",
     )
     parser.add_argument(
         "--max-seq-len",

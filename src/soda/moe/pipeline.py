@@ -28,7 +28,7 @@ from soda.moe.prompts import (
     get_prompts_for_categories,
 )
 
-_DEFAULT_WARMUP = 2
+_DEFAULT_WARMUP = 0
 
 
 class MoEProfilePipeline:
