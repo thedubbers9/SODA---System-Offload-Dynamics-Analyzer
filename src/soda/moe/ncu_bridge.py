@@ -90,6 +90,17 @@ def _make_kernel_entry(
     tensor, which causes ``F.linear`` to raise "bias must be 1-dimensional".
     """
     filtered = [s for s in input_shapes if s]
+
+    # aten::addmm expects (bias, input, weight) — 3 operands.
+    # When bias=None the profiler records input_shapes=[[], [M,K], [K,N]], which
+    # after filtering becomes [[M,K], [K,N]] (2 items).
+    # SUPPORTED_OPS["aten::addmm"] calls torch.addmm(inputs[0], inputs[1], inputs[2]),
+    # so inputs[2] must exist. Synthesize a 1-D bias of shape [N] where N = weight[-1].
+    if op_name == "aten::addmm" and len(filtered) == 2:
+        weight_shape = filtered[1]
+        N = weight_shape[-1] if weight_shape else 1
+        filtered = [[N]] + filtered  # prepend bias shape
+
     return {
         "id": entry_id,
         "aten_op": {
@@ -169,10 +180,15 @@ def run_ncu_on_profiler_events(
         if op_name not in _NCU_ELIGIBLE_OPS:
             continue
         input_shapes = evt.get("input_shapes") or []
-        input_types = [model_dtype] * len(input_shapes)
-        key = (op_name, _shapes_key(input_shapes), _types_key(input_types))
+        # Use filtered shapes (empty slots = None args removed) as the dedup key
+        # so the key matches exactly what _make_kernel_entry will replay.
+        # Empty shapes (e.g. absent bias in aten::linear) are skipped in replay;
+        # including them in the key would create phantom distinct entries.
+        filtered = [s for s in input_shapes if s]
+        input_types = [model_dtype] * len(filtered)
+        key = (op_name, _shapes_key(filtered), _types_key(input_types))
         if key not in seen:
-            seen[key] = input_shapes
+            seen[key] = filtered
 
     if not seen:
         warnings.warn(
@@ -189,10 +205,13 @@ def run_ncu_on_profiler_events(
     # ---- Step 2: run ncu for each unique entry ----
     results: Dict[Tuple, Dict] = {}
 
-    for idx, (key, input_shapes) in enumerate(seen.items()):
+    for idx, (key, filtered_shapes) in enumerate(seen.items()):
         op_name = key[0]
         entry_id = f"NCU_{idx:04d}_{op_name.replace('aten::', '').replace(':', '_')}"
-        kernel_entry = _make_kernel_entry(op_name, input_shapes, model_dtype, entry_id)
+        # filtered_shapes already has empty slots removed (see dedup step above).
+        # _make_kernel_entry receives pre-filtered shapes; its own filter pass is
+        # a no-op, but the addmm bias synthesis logic still applies.
+        kernel_entry = _make_kernel_entry(op_name, filtered_shapes, model_dtype, entry_id)
 
         try:
             ncu_result = ncu_profile_kernel(
@@ -209,31 +228,52 @@ def run_ncu_on_profiler_events(
             continue
 
         if ncu_result is None:
+            warnings.warn(
+                f"ncu_bridge: NCU returned no data for {entry_id} ({op_name}) "
+                "— entry excluded from HBM results.",
+                stacklevel=2,
+            )
             continue
 
-        metrics = ncu_result.get("metrics", {})
-
         def _safe_float(val) -> float:
-            """Convert metric value to float, returning 0.0 for 'n/a' or None."""
+            """Convert metric value to float; returns 0.0 for 'n/a', None, or errors."""
             try:
                 return float(val or 0.0)
             except (TypeError, ValueError):
                 return 0.0
 
-        # Try Blackwell metric names first (dram__bytes_op_read.sum), then fall
-        # back to pre-Blackwell names (dram__bytes_read.sum).  On Blackwell the
-        # old counter name was renamed so '.sum' on the old name returns 'n/a'.
-        hbm_read = _safe_float(
-            metrics.get("dram__bytes_op_read.sum")
-            or metrics.get("dram__bytes_read.sum")
+        metrics = ncu_result.get("metrics", {})
+
+        def _pick_numeric(m: dict, *keys: str) -> float:
+            """Return the first numerically valid value among keys.
+
+            Uses explicit None check so that "n/a" strings (present in the
+            CSV when a metric doesn't apply to the current GPU generation)
+            are skipped rather than stopping an `or`-chain prematurely.
+            """
+            for key in keys:
+                val = m.get(key)
+                if val is None:
+                    continue
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue  # "n/a" or empty — try next key
+            return 0.0
+
+        # Try Blackwell metric names first (CC 12.x+), fall back to pre-Blackwell.
+        # Must use _pick_numeric (not `or`) — on pre-Blackwell GPUs the Blackwell
+        # metric is present as the string "n/a" which is truthy and would stop
+        # an `or`-chain before reaching the valid pre-Blackwell name.
+        hbm_read = _pick_numeric(
+            metrics, "dram__bytes_op_read.sum", "dram__bytes_read.sum"
         )
-        hbm_write = _safe_float(
-            metrics.get("dram__bytes_op_write.sum")
-            or metrics.get("dram__bytes_write.sum")
+        hbm_write = _pick_numeric(
+            metrics, "dram__bytes_op_write.sum", "dram__bytes_write.sum"
         )
         l2_bytes = _safe_float(metrics.get("lts__t_bytes.sum", 0.0))
 
-        # Compute CTA count from the kernel's grid dimensions.
+        # Compute CTA count from the kernel's grid dimensions (parsed from NCU CSV).
         grid_size = ncu_result.get("grid_size", [1, 1, 1])
         cta_count = 1
         for dim in grid_size:
@@ -280,8 +320,11 @@ def merge_ncu_into_events(
     for evt in events:
         op_name = evt.get("aten_op", "")
         input_shapes = evt.get("input_shapes") or []
-        input_types = [model_dtype] * len(input_shapes)
-        key = (op_name, _shapes_key(input_shapes), _types_key(input_types))
+        # Use filtered shapes as lookup key — must match the key built in
+        # run_ncu_on_profiler_events (which also uses filtered shapes).
+        filtered = [s for s in input_shapes if s]
+        input_types = [model_dtype] * len(filtered)
+        key = (op_name, _shapes_key(filtered), _types_key(input_types))
         ncu = ncu_results.get(key)
         if ncu is None:
             continue
@@ -293,7 +336,7 @@ def merge_ncu_into_events(
         # Stamp num_kernels from the NCU grid CTA count so that
         # generate_op_profile_from_cupti produces a non-zero cta_count.
         # On Blackwell/RTX 6000 the PyTorch profiler tree does not expose
-        # CUDA kernel children, leaving num_kernels=0.  NCU confirms the
+        # CUDA kernel children, leaving num_kernels=0. NCU confirms the
         # kernel ran and gives us its actual grid dimensions.
         ncu_cta = ncu.get("cta_count", 0)
         if ncu_cta > 0:

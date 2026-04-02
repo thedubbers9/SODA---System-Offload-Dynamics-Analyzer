@@ -652,12 +652,12 @@ def generate_op_profile_from_cupti(
             "kv_bytes": 0.0,
         }
 
-        # Use num_kernels as cta_count.  On RTX 6000 / Blackwell the PyTorch
+        # Use num_kernels as cta_count. On Blackwell/RTX 6000 the PyTorch
         # profiler tree does not expose CUDA kernel children, so num_kernels
-        # may be 0 even when the op dispatched GPU work.  Fall back to 1
+        # may be 0 even when the op dispatched GPU work. For NCU-eligible ops
+        # ncu_bridge already stamps num_kernels with the actual grid CTA count
+        # before this function is called. For all other ops, fall back to 1
         # whenever cuda_time_us > 0 to avoid spurious cta_count=0 entries.
-        # For NCU-eligible ops the ncu_bridge already stamps num_kernels with
-        # the actual grid CTA count before this function is called.
         raw_cta = evt.get("num_kernels", 0)
         cuda_t = evt.get("cuda_time_us", 0.0) or 0.0
         cta_count = raw_cta if raw_cta > 0 else (1 if cuda_t > 0.0 else 0)
