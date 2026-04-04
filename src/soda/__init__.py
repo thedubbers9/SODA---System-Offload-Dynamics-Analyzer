@@ -1276,7 +1276,7 @@ class ModelTracer:
                     # Find the layer index data for the given output.
                     step_data = gate_tracker.finish_step(run_idx)
                     if step_data:
-                        gate_trace[str(run_idx)] = step_datas
+                        gate_trace[str(run_idx)] = step_data
                     
                     if _is_last:
                         _last_kv_output = _out
