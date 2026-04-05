@@ -446,6 +446,20 @@ def save_json(file_path: str | Path, data: Dict[str, Any], indent: int = 2) -> N
         json.dump(data, f, indent=indent, ensure_ascii=False)
 
 
+def save_clean_json(file_path: str | Path, data: Dict[str, Any], indent: int = 2) -> None:
+    """
+    Save dictionary to JSON file.
+    
+    Args:
+        file_path: Path to output file (str or Path object).
+        data: Dictionary to save.
+        indent: JSON indentation (default: 2).
+    """
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        json.dump(data, f, indent=indent, ensure_ascii=False)
+
 def write_log(log_key: str, log: str) -> None:
     """Write a log message to the specified log file."""
     try:

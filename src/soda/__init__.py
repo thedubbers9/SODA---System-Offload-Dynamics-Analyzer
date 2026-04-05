@@ -1311,7 +1311,7 @@ class ModelTracer:
 
         if hooked_layers > 0 and gate_trace:
             decode_gate_path = self.output_dir / "decode_gate_trace.json"
-            utils.save_json(decode_gate_path, gate_trace)
+            utils.save_clean_json(decode_gate_path, gate_trace)
             print(f"Decode gate trace saved to: {decode_gate_path}")
         elif hooked_layer == 0:
             print("ERROR : Hooked layer is ZERO!")
