@@ -48,8 +48,8 @@ export EXPERIMENT_DIR=""
 # export HF_HOME="${HF_HOME:-/tmp/hf_cache_${USER:-$(id -un)}}"
 export HF_HOME="/scratch/${USER:-$(id -un)}/hf_cache"
 
-# Python path setup for imports (safe when PYTHONPATH is unset under set -u)
-export PYTHONPATH="$SODA_SRC:${PYTHONPATH:-}"
+# Python path setup for imports (safe under `set -u` when PYTHONPATH is unset)
+export PYTHONPATH="$SODA_SRC${PYTHONPATH:+:$PYTHONPATH}"
 
 # ============================================================
 # Microbench paths

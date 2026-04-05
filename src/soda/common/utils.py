@@ -878,40 +878,48 @@ def get_args_parser() -> argparse.ArgumentParser:
              "Default: <output_root>/.global_kernel_cache/<gpu_slug>/",
     )
 
-    # --- MoE per-expert-type memory profiling (Stage 3) ---
+    # --- MoE per-operator memory profiling via CUPTI ---
     parser.add_argument(
         "--moe-profile",
         dest="moe_profile",
         action="store_true",
         default=False,
-        help="Run MoE per-expert-type memory profiling. Requires --kernel-db-path. "
-             "Reports NCU isolation HBM bytes when ncu is available. No model loading required.",
+        help="Run standalone MoE per-operator memory profiling using PyTorch "
+             "Profiler with CUPTI hardware counters (dram bytes, L2 traffic). "
+             "Requires -m/--model. Uses curated benchmark prompts from "
+             "soda.moe.prompts. Outputs per-prompt and aggregated op_profile.json.",
     )
     parser.add_argument(
-        "--moe-shared-dim",
-        dest="moe_shared_dim",
-        type=int,
+        "--moe-prompts",
+        dest="moe_prompts",
+        nargs="*",
         default=None,
-        help="Override auto-detected shared expert intermediate dimension "
-             "(weight shape[0]). Used with --moe-profile.",
+        help="Specific prompt names to profile (default: 7 representative prompts). "
+             "See soda.moe.prompts.MOE_BENCHMARK_PROMPTS for available names.",
     )
     parser.add_argument(
-        "--moe-routed-dim",
-        dest="moe_routed_dim",
-        type=int,
+        "--moe-categories",
+        dest="moe_categories",
+        nargs="*",
         default=None,
-        help="Override auto-detected routed expert intermediate dimension "
-             "(weight shape[0]). Used with --moe-profile.",
+        help="Prompt categories to profile (e.g., code science legal). "
+             "Overridden by --moe-prompts if both specified.",
     )
     parser.add_argument(
-        "--moe-num-layers",
-        dest="moe_num_layers",
+        "--moe-warmup",
+        dest="moe_warmup",
         type=int,
-        default=None,
-        help="Override auto-detected number of transformer layers. "
-             "Used with --moe-profile to control layer_id expansion in "
-             "op_profile.json. Defaults to GCD-based detection from shared "
-             "expert entry frequencies.",
+        default=0,
+        help="Number of warmup iterations before CUPTI profiling (default: 0).",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        dest="max_seq_len",
+        type=int,
+        default=4096,
+        help="Safety truncation cap for MoE CUPTI profiling (default: 4096). "
+             "Prompts are tokenized at natural length; this only truncates "
+             "prompts that exceed the limit.",
     )
 
     return parser
@@ -922,10 +930,9 @@ def parse_and_validate_args(args=None) -> argparse.Namespace:
     parsed_args = parser.parse_args(args)
     
     # Validate arguments
-    # --model is required unless running in --taxbreak or --moe-profile mode
+    # --model is required unless running in --taxbreak mode
     _no_model_modes = (
         getattr(parsed_args, "taxbreak", False)
-        or getattr(parsed_args, "moe_profile", False)
     )
     if not _no_model_modes and not parsed_args.model:
         parser.error("the following arguments are required: -m/--model")
