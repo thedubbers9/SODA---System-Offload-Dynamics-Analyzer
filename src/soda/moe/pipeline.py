@@ -269,7 +269,6 @@ class MoEProfilePipeline:
             ncu_output_dir=ncu_dir,
             model_dtype=self.precision,
         )
-        print(f"[MoE Profile] MoE debug log: {moe_debug_path}")
 
         if ncu_results:
             # Stamp back into per-prompt event lists
