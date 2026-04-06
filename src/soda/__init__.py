@@ -19,6 +19,8 @@ from pathlib import Path
 from torch.profiler import ProfilerActivity, profile
 from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 
+from soda.decodehook import DecodeGateHookTracker
+
 # for fp8 e4m3 format support
 try:
     from transformers.utils.quantization_config import FP8Config
@@ -1225,6 +1227,10 @@ class ModelTracer:
         if self._has_cuda:
             utils.report_gpu_clocks(context="after warmup, before profiling")
 
+        gate_tracker = DecodeGateHookTracker(top_k=getattr(self.args, "num_experts_per_tok", 4))
+        hooked_layers = gate_tracker.attach(self.model)
+        gate_trace = {}
+
         # Profiled runs - run num_runs inferences within profiler
         # All runs are captured in a single trace; metrics are averaged by frequency
         with torch.no_grad():
@@ -1247,6 +1253,7 @@ class ModelTracer:
                 for run_idx in range(num_runs):
                     _is_last = (run_idx == num_runs - 1)
                     # FIX: Use TE FP8 autocast if recipe is available
+                    gate_tracker.start_step(run_idx)
                     if self.is_fp8 and getattr(self, 'fp8_recipe', None):
                         import transformer_engine.pytorch as te
                         with te.fp8_autocast(enabled=True, fp8_recipe=self.fp8_recipe):
@@ -1265,6 +1272,12 @@ class ModelTracer:
                             pad_token_id=self.tokenizer.pad_token_id,
                             return_dict_in_generate=_is_last,
                         )
+
+                    # Find the layer index data for the given output.
+                    step_data = gate_tracker.finish_step(run_idx)
+                    if step_data:
+                        gate_trace[str(run_idx)] = step_data
+
                     if _is_last:
                         _last_kv_output = _out
                     del _out
@@ -1290,6 +1303,17 @@ class ModelTracer:
 
         # Capture peak memory after profiled inference
         self._capture_peak_memory()
+
+        gate_tracker.detach()
+
+        if hooked_layers > 0 and gate_trace:
+            decode_gate_path = self.output_dir / "decode__routed_experts_trace.json"
+            utils.save_json(decode_gate_path, gate_trace)
+            print(f"Decode Routed Experts trace saved to: {decode_gate_path}")
+        elif hooked_layers == 0:
+            print("ERROR : Hooked layer is ZERO!")
+        elif gate_trace is None:
+            print("ERROR : Gate trace is None.")
 
         prof.export_chrome_trace(str(self.trace_file))
 
