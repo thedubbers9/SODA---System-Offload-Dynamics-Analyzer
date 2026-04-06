@@ -85,9 +85,10 @@ class MoEProfilePipeline:
 
         # 4. Profile each prompt (collect events only — no file writing yet)
         all_events: Dict[str, List[Dict]] = {}
+        all_token_counts: Dict[str, Dict[str, int]] = {}
         for i, (name, text) in enumerate(prompts, 1):
             print(f"  [{i}/{len(prompts)}] Profiling: {name}")
-            events = profile_single_prompt(
+            events, token_info = profile_single_prompt(
                 model=model,
                 tokenizer=tokenizer,
                 prompt_text=text,
@@ -96,6 +97,7 @@ class MoEProfilePipeline:
                 precision=self.precision,
             )
             all_events[name] = events
+            all_token_counts[name] = token_info
 
         # 5. NCU bridge: fill HBM/L2 bytes when CUPTI returned zeros
         self._run_ncu_bridge_if_needed(all_events)
@@ -111,7 +113,7 @@ class MoEProfilePipeline:
         print(f"\n[MoE CUPTI Profile] Aggregated: {agg_path}")
 
         # 8. Write metadata
-        self._write_metadata(prompts, all_events)
+        self._write_metadata(prompts, all_events, all_token_counts)
 
         # 9. Print summary
         self._print_summary(all_events)
@@ -307,6 +309,7 @@ class MoEProfilePipeline:
         self,
         prompts: List[tuple],
         all_events: Dict[str, List[Dict]],
+        all_token_counts: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> None:
         """Write metadata.json with run configuration and summary."""
         # Determine CUPTI/NCU status from events
@@ -332,6 +335,7 @@ class MoEProfilePipeline:
             "events_per_prompt": {
                 name: len(evts) for name, evts in all_events.items()
             },
+            "token_counts_per_prompt": all_token_counts or {},
         }
         meta_path = self.output_dir / "metadata.json"
         meta_path.write_text(json.dumps(metadata, indent=2))
