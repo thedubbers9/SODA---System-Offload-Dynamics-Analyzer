@@ -601,7 +601,7 @@ def profile_single_prompt(
     max_new_tokens: int = 1,
     device: Optional[torch.device] = None,
     precision: str = "bfloat16",
-) -> List[Dict]:
+):
     """Profile a single prompt and return per-operator memory measurements.
 
     The prompt is tokenized at its **natural length** (no padding).  Each
@@ -620,11 +620,13 @@ def profile_single_prompt(
         precision: Precision string for shape-based fallback (e.g. "bfloat16").
 
     Returns:
-        List of dicts, one per CPU ATen operator event, each containing:
-        ``aten_op``, ``module_path``, ``input_shapes``, ``cuda_time_us``,
-        ``hbm_bytes``, ``l2_bytes``, ``hbm_read_bytes``, ``hbm_write_bytes``,
-        ``flops``, ``expert_type``, ``layer_id``, ``projection_type``,
-        ``cupti_available`` (bool).
+        Tuple of:
+        - List of dicts, one per CPU ATen operator event, each containing:
+          ``aten_op``, ``module_path``, ``input_shapes``, ``cuda_time_us``,
+          ``hbm_bytes``, ``l2_bytes``, ``hbm_read_bytes``, ``hbm_write_bytes``,
+          ``flops``, ``expert_type``, ``layer_id``, ``projection_type``,
+          ``cupti_available`` (bool).
+        - Dict with ``prefill_tokens`` (int) and ``decode_tokens`` (int).
     """
     from torch.profiler import ProfilerActivity
 
@@ -642,6 +644,7 @@ def profile_single_prompt(
         max_length=max_seq_len,
         truncation=True,
     )
+    prefill_tokens = int(inputs["input_ids"].shape[1])
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     # Build profiler config
@@ -671,16 +674,19 @@ def profile_single_prompt(
     _patched = _install_profiler_module_hooks(model)
 
     # Profile
+    output_ids = None
     try:
         with torch.no_grad():
             with torch.profiler.profile(**profiler_kwargs) as prof:
-                model.generate(
+                output_ids = model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                 )
     finally:
         _uninstall_profiler_module_hooks(_patched)
+
+    actual_decode_tokens = int(output_ids.shape[1]) - prefill_tokens if output_ids is not None else max_new_tokens
 
     # Collect results — only aten:: operators, not profiler infrastructure
     dtype_bytes = _dtype_bytes(precision)
@@ -786,4 +792,5 @@ def profile_single_prompt(
                 stacklevel=2,
             )
 
-    return records
+    token_info = {"prefill_tokens": prefill_tokens, "decode_tokens": actual_decode_tokens}
+    return records, token_info
