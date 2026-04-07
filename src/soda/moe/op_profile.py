@@ -355,9 +355,35 @@ def _ops_per_layer(freq: int, num_layers: int) -> int:
     return 0
 
 
+def _aten_op_record(aten_op: Optional[Dict] = None) -> Dict:
+    """Return kernel-DB-compatible ``aten_op`` subdict for ``op_profile.json``."""
+    if not isinstance(aten_op, dict):
+        aten_op = {}
+    return {
+        "name": aten_op.get("name", ""),
+        "input_dims": aten_op.get("input_dims", []),
+        "input_strides": aten_op.get("input_strides", []),
+        "input_type": aten_op.get("input_type", []),
+        "concrete_inputs": aten_op.get("concrete_inputs", []),
+    }
+
+
+def _aten_op_from_cupti_evt(evt: Dict) -> Dict:
+    """Build ``aten_op`` dict from a :func:`cupti_profiler.profile_single_prompt` event."""
+    raw = evt.get("aten_op", "")
+    if isinstance(raw, dict):
+        return _aten_op_record(raw)
+    name = raw if isinstance(raw, str) else ""
+    return _aten_op_record({
+        "name": name,
+        "input_dims": evt.get("input_shapes") or [],
+    })
+
+
 def _make_record(
     layer_id: int,
     op_name: str,
+    aten_op: Dict,
     hbm_fields: Dict,
     cta_count: int,
     latency_us: float,
@@ -370,6 +396,7 @@ def _make_record(
     return {
         "layer_id": layer_id,
         "op_name": op_name,
+        "aten_op": aten_op,
         "flops": hbm_fields["flops"],
         "hbm_bytes": hbm_fields["hbm_bytes"],
         "weight_bytes": hbm_fields["weight_bytes"],
@@ -477,6 +504,7 @@ def generate_op_profile(
         pos = shape_position.get(shape_key, 0)
         shape_position[shape_key] = pos + (ops_count if is_layer_local else 1)
 
+        aten_op_ctx = _aten_op_record(aten_op)
         if is_layer_local:
             for layer_id in range(num_layers):
                 for sub_pos in range(ops_count):
@@ -484,6 +512,7 @@ def generate_op_profile(
                     records.append(_make_record(
                         layer_id=layer_id,
                         op_name=op_name_n,
+                        aten_op=aten_op_ctx,
                         hbm_fields=hbm_fields,
                         cta_count=cta_count,
                         latency_us=latency_us,
@@ -495,6 +524,7 @@ def generate_op_profile(
             records.append(_make_record(
                 layer_id=-1,
                 op_name=op_name,
+                aten_op=aten_op_ctx,
                 hbm_fields=hbm_fields,
                 cta_count=cta_count,
                 latency_us=latency_us,
@@ -605,6 +635,7 @@ def generate_op_profile_from_cupti(
 
         op_name = _infer_op_name_from_module(aten_op, expert_type, projection_type)
         is_shared = expert_type == "shared_expert"
+        aten_op_ctx = _aten_op_from_cupti_evt(evt)
 
         hbm_fields = {
             "flops": evt.get("flops", 0),
@@ -627,6 +658,7 @@ def generate_op_profile_from_cupti(
         record = _make_record(
             layer_id=layer_id,
             op_name=op_name,
+            aten_op=aten_op_ctx,
             hbm_fields=hbm_fields,
             cta_count=cta_count,
             latency_us=cuda_t,
