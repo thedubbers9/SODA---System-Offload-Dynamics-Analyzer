@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from soda.moe.cupti_profiler import profile_single_prompt
 from soda.moe.ncu_bridge import merge_ncu_into_events, run_ncu_on_profiler_events
+import soda.moe.op_profile as _op_profile_mod
 from soda.moe.op_profile import generate_op_profile_from_cupti
 from soda.moe.prompts import (
     MOE_BENCHMARK_PROMPTS,
@@ -103,6 +104,7 @@ class MoEProfilePipeline:
         self._run_ncu_bridge_if_needed(all_events)
 
         # 6. Write per-prompt op_profile files (after NCU bridge so hbm_bytes are real)
+        print(f"[MoE CUPTI Profile] soda.moe.op_profile: {_op_profile_mod.__file__}")
         for name, events in all_events.items():
             per_prompt_path = self.per_prompt_dir / f"op_profile_{name}.json"
             records = generate_op_profile_from_cupti(events, output_path=per_prompt_path)

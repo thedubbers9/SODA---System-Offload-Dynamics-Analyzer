@@ -390,6 +390,7 @@ def _make_record(
     is_shared: bool,
     expert_type: str,
     l2_bytes: float = 0.0,
+    kernel_name: str = "",
 ) -> Dict:
     """Build a single op_profile record dict."""
     shared_expert_bytes = hbm_fields["hbm_bytes"] if is_shared else 0.0
@@ -397,6 +398,7 @@ def _make_record(
         "layer_id": layer_id,
         "op_name": op_name,
         "aten_op": aten_op,
+        "kernel_name": kernel_name,
         "flops": hbm_fields["flops"],
         "hbm_bytes": hbm_fields["hbm_bytes"],
         "weight_bytes": hbm_fields["weight_bytes"],
@@ -505,6 +507,9 @@ def generate_op_profile(
         shape_position[shape_key] = pos + (ops_count if is_layer_local else 1)
 
         aten_op_ctx = _aten_op_record(aten_op)
+        kn = kernel.get("name") or kernel.get("raw_name") or ""
+        kernel_name = kn.strip() if isinstance(kn, str) else (str(kn).strip() if kn else "")
+
         if is_layer_local:
             for layer_id in range(num_layers):
                 for sub_pos in range(ops_count):
@@ -518,6 +523,7 @@ def generate_op_profile(
                         latency_us=latency_us,
                         is_shared=is_shared,
                         expert_type=expert_type,
+                        kernel_name=kernel_name,
                     ))
         else:
             op_name = _infer_op_name(aten_op_name, expert_type, input_dims, pos, projection_type)
@@ -530,6 +536,7 @@ def generate_op_profile(
                 latency_us=latency_us,
                 is_shared=is_shared,
                 expert_type=expert_type,
+                kernel_name=kernel_name,
             ))
 
     # Sort: layer_id ASC with -1 at the end, then op_name for stability.
@@ -609,8 +616,8 @@ def generate_op_profile_from_cupti(
 
     Each event dict is expected to contain the fields produced by
     :func:`cupti_profiler.profile_single_prompt`:
-    ``aten_op``, ``expert_type``, ``layer_id``, ``projection_type``,
-    ``hbm_bytes``, ``l2_bytes``, ``flops``, ``weight_bytes``,
+    ``aten_op``, ``kernel_name`` (optional), ``expert_type``, ``layer_id``,
+    ``projection_type``, ``hbm_bytes``, ``l2_bytes``, ``flops``, ``weight_bytes``,
     ``activation_bytes``, ``cuda_time_us``, ``num_kernels``.
 
     Args:
@@ -665,6 +672,7 @@ def generate_op_profile_from_cupti(
             is_shared=is_shared,
             expert_type=expert_type,
             l2_bytes=evt.get("l2_bytes", 0.0),
+            kernel_name=str(evt.get("kernel_name", "") or "").strip(),
         )
         record["hbm_source"] = evt.get("hbm_source", "unknown")
         records.append(record)

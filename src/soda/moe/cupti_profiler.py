@@ -395,6 +395,24 @@ def _iter_cuda_kernel_events(evt):
         yield k
 
 
+def _kernel_names_joined(evt) -> str:
+    """Collect unique CUDA kernel names under this CPU ATen op (order preserved).
+
+    Matches the ``kernel_name`` strings used in power reporting (e.g. taxbreak
+    ``power_report.json``). Multiple kernels are joined with ``"; "``.
+    """
+    names: List[str] = []
+    seen_names = set()
+    for kernel_evt in _iter_cuda_kernel_events(evt):
+        kn = getattr(kernel_evt, "name", None)
+        kn = (kn or "").strip()
+        if not kn or kn in seen_names:
+            continue
+        seen_names.add(kn)
+        names.append(kn)
+    return "; ".join(names)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -622,7 +640,8 @@ def profile_single_prompt(
     Returns:
         Tuple of:
         - List of dicts, one per CPU ATen operator event, each containing:
-          ``aten_op``, ``module_path``, ``input_shapes``, ``cuda_time_us``,
+          ``aten_op``, ``kernel_name`` (CUDA kernel name(s), ``"; "``-joined if
+          several), ``module_path``, ``input_shapes``, ``cuda_time_us``,
           ``hbm_bytes``, ``l2_bytes``, ``hbm_read_bytes``, ``hbm_write_bytes``,
           ``flops``, ``expert_type``, ``layer_id``, ``projection_type``,
           ``cupti_available`` (bool).
@@ -756,6 +775,7 @@ def profile_single_prompt(
 
         records.append({
             "aten_op": aten_op,
+            "kernel_name": _kernel_names_joined(evt),
             "module_path": module_path,
             "input_shapes": input_shapes,
             "cuda_time_us": cuda_time_us,
