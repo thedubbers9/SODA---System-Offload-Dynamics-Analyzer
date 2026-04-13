@@ -559,6 +559,7 @@ class TaxBreakPipeline:
             num_windows=getattr(self.args, "power_replay_windows", 3),
             interval_ms=getattr(self.args, "power_replay_interval", 50),
             max_kernels=None,  # already sliced above
+            resume=getattr(self.args, "power_replay_resume", True),
         )
         return results, idle_w
 

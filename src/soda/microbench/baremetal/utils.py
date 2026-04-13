@@ -3,6 +3,7 @@
 Utilities for baremetal microbenchmarking: nsys profiling, trace extraction, and build helpers.
 """
 
+import os
 import shutil
 import subprocess
 import sqlite3
@@ -418,10 +419,20 @@ def build_binary():
     baremetal_dir = utils.get_path("BAREMETAL_MICROBENCH_DIR")
     print("Building C++ binary")
     build_dir = baremetal_dir / "build"
-    
+    # Match CMakeLists default: newer nvcc drops Volta (sm_70). Override with
+    # SODA_CUDA_ARCHS="90" (single arch) for faster builds when you know the GPU.
+    _default_cuda_archs = "75;80;86;89;90;100;120"
+    cuda_archs = os.environ.get("SODA_CUDA_ARCHS", _default_cuda_archs)
+
     # Configure
     result = subprocess.run(
-        ["cmake", "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Release"],
+        [
+            "cmake",
+            "-B",
+            str(build_dir),
+            "-DCMAKE_BUILD_TYPE=Release",
+            f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
+        ],
         cwd=str(baremetal_dir),
         capture_output=True,
         text=True

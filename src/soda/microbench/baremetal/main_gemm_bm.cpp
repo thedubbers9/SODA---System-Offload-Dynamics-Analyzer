@@ -3,21 +3,34 @@
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <iostream>
+#ifndef SODA_NO_NVTX
 #include <nvtx3/nvToolsExt.h>
+#endif
 #include <string>
 #include <vector>
 
 class NvtxRange {
 public:
   NvtxRange(const char *base, const char *temperature = nullptr) {
+#ifndef SODA_NO_NVTX
     const char *temp = temperature ? temperature : "hot";
     label_ = std::string(base) + ":" + temp;
     nvtxRangePushA(label_.c_str());
+#else
+    (void)base;
+    (void)temperature;
+#endif
   }
-  ~NvtxRange() { nvtxRangePop(); }
+  ~NvtxRange() {
+#ifndef SODA_NO_NVTX
+    nvtxRangePop();
+#endif
+  }
 
 private:
+#ifndef SODA_NO_NVTX
   std::string label_;
+#endif
 };
 
 // Helper macros for error checking
@@ -758,19 +771,15 @@ TimingResult run_gemm_timed(const GemmParams &params, MatBufs &matBufs,
   bool transpose_B = (op_B == CUBLAS_OP_T);
 
   CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(
-      &A_desc, cuda_dtype,
-      transpose_A ? params.k : params.m,
-      transpose_A ? params.m : params.k,
-      params.lda));
+      &A_desc, cuda_dtype, transpose_A ? params.k : params.m,
+      transpose_A ? params.m : params.k, params.lda));
 
   CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(
-      &B_desc, cuda_dtype,
-      transpose_B ? params.n : params.k,
-      transpose_B ? params.k : params.n,
-      params.ldb));
+      &B_desc, cuda_dtype, transpose_B ? params.n : params.k,
+      transpose_B ? params.k : params.n, params.ldb));
 
-  CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&C_desc, cuda_dtype,
-                                             params.m, params.n, params.ldc));
+  CHECK_CUBLASLT(cublasLtMatrixLayoutCreate(&C_desc, cuda_dtype, params.m,
+                                            params.n, params.ldc));
 
   // Set matrix order for row-major (same as run_gemm)
   if (params.order_a == "row" || params.order_b == "row") {
@@ -778,7 +787,7 @@ TimingResult run_gemm_timed(const GemmParams &params, MatBufs &matBufs,
         (params.order_a == "col") ? CUBLASLT_ORDER_COL : CUBLASLT_ORDER_ROW;
     cublasLtOrder_t order_b =
         (params.order_b == "col") ? CUBLASLT_ORDER_COL : CUBLASLT_ORDER_ROW;
-    cublasLtOrder_t order_c = CUBLASLT_ORDER_ROW;  // Output is always row-major
+    cublasLtOrder_t order_c = CUBLASLT_ORDER_ROW; // Output is always row-major
 
     CHECK_CUBLASLT(cublasLtMatrixLayoutSetAttribute(
         A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_a, sizeof(order_a)));
@@ -788,7 +797,8 @@ TimingResult run_gemm_timed(const GemmParams &params, MatBufs &matBufs,
         C_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_c, sizeof(order_c)));
   }
 
-  CHECK_CUBLASLT(cublasLtMatmulDescCreate(&matmul_desc, compute_type, cuda_dtype));
+  CHECK_CUBLASLT(
+      cublasLtMatmulDescCreate(&matmul_desc, compute_type, cuda_dtype));
   CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
       matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_A, sizeof(op_A)));
   CHECK_CUBLASLT(cublasLtMatmulDescSetAttribute(
@@ -803,8 +813,8 @@ TimingResult run_gemm_timed(const GemmParams &params, MatBufs &matBufs,
 
   // === HEURISTIC PHASE ===
   CHECK_CUBLASLT(cublasLtMatmulAlgoGetHeuristic(
-      handle, matmul_desc, A_desc, B_desc, C_desc, C_desc, preference,
-      1, heuristic_results.data(), &returned_results));
+      handle, matmul_desc, A_desc, B_desc, C_desc, C_desc, preference, 1,
+      heuristic_results.data(), &returned_results));
 
   if (returned_results == 0) {
     std::cerr << "Error: No cuBLASLt algorithm found" << std::endl;
@@ -818,10 +828,10 @@ TimingResult run_gemm_timed(const GemmParams &params, MatBufs &matBufs,
   float alpha = params.alpha;
   float beta = params.beta;
 
-  CHECK_CUBLASLT(cublasLtMatmul(
-      handle, matmul_desc, &alpha, matBufs.d_A, A_desc, matBufs.d_B, B_desc,
-      &beta, matBufs.d_C, C_desc, matBufs.d_C, C_desc, &selected_algo,
-      workspace.ptr, workspace_size, 0));
+  CHECK_CUBLASLT(cublasLtMatmul(handle, matmul_desc, &alpha, matBufs.d_A,
+                                A_desc, matBufs.d_B, B_desc, &beta, matBufs.d_C,
+                                C_desc, matBufs.d_C, C_desc, &selected_algo,
+                                workspace.ptr, workspace_size, 0));
 
   CHECK_CUDA(cudaEventRecord(after_run, 0));
   CHECK_CUDA(cudaEventSynchronize(after_run));
@@ -919,7 +929,8 @@ int main(int argc, char **argv) {
   std::cout << "  \"t_setup_us\": " << mean_setup << "," << std::endl;
   std::cout << "  \"t_heur_us\": " << mean_heur << "," << std::endl;
   std::cout << "  \"t_run_us\": " << mean_run << "," << std::endl;
-  std::cout << "  \"t_culib_total_us\": " << (mean_setup + mean_heur) << "," << std::endl;
+  std::cout << "  \"t_culib_total_us\": " << (mean_setup + mean_heur) << ","
+            << std::endl;
   std::cout << "  \"t_total_us\": " << mean_total << std::endl;
   std::cout << "}" << std::endl;
   std::cout << "TIMING_RESULTS_END" << std::endl;

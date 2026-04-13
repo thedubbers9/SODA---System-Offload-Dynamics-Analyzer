@@ -1006,6 +1006,17 @@ def get_args_parser() -> argparse.ArgumentParser:
             "(default: None = all unique kernels). Useful for time-limited runs."
         ),
     )
+    parser.add_argument(
+        "--no-power-replay-resume",
+        dest="power_replay_resume",
+        action="store_false",
+        default=True,
+        help=(
+            "Ignore power_replay_checkpoint.json in the taxbreak output directory and "
+            "start power replay from scratch. Default is to resume: skip kernels "
+            "already recorded in the checkpoint (safe to stop/restart the run)."
+        ),
+    )
 
     return parser
 

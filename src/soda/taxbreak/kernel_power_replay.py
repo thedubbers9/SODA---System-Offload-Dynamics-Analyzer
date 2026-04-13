@@ -529,6 +529,72 @@ def power_profile_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint (resume after interrupt / GPU handoff)
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_VERSION = 1
+
+
+def _default_checkpoint_path(output_dir: Path) -> Path:
+    return output_dir / "power_replay_checkpoint.json"
+
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _power_replay_settings_key(
+    target_warmup_ms: int,
+    target_meas_ms: int,
+    num_windows: int,
+    interval_ms: int,
+) -> Dict[str, int]:
+    return {
+        "target_warmup_ms": target_warmup_ms,
+        "target_meas_ms": target_meas_ms,
+        "num_windows": num_windows,
+        "interval_ms": interval_ms,
+    }
+
+
+def _load_power_checkpoint(
+    path: Path,
+    expected_settings: Dict[str, int],
+) -> Tuple[Dict[str, Dict[str, Any]], float, bool, bool]:
+    """Return (results_by_kernel_id, idle_baseline_w, settings_match, idle_recorded)."""
+    if not path.is_file():
+        return {}, 0.0, True, False
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        print(f"  Warning: could not read checkpoint {path}; starting fresh.")
+        return {}, 0.0, True, False
+
+    if raw.get("version") != _CHECKPOINT_VERSION:
+        print(f"  Warning: checkpoint version mismatch; starting fresh.")
+        return {}, 0.0, True, False
+
+    saved = raw.get("settings") or {}
+    settings_match = saved == expected_settings
+    if not settings_match:
+        print(
+            "  Warning: power replay hyperparameters differ from checkpoint file.\n"
+            "  Completed kernels are still skipped; delete the checkpoint or use "
+            "--no-power-replay-resume for a full re-run with current settings."
+        )
+
+    kernels = raw.get("kernels") or {}
+    idle_w = float(raw.get("idle_baseline_w", 0.0))
+    idle_recorded = bool(raw.get("idle_baseline_recorded", False)) or len(kernels) > 0
+    return kernels, idle_w, settings_match, idle_recorded
+
+
+# ---------------------------------------------------------------------------
 # All-kernels driver
 # ---------------------------------------------------------------------------
 
@@ -542,16 +608,19 @@ def power_profile_all_kernels(
     interval_ms: int = 50,
     max_kernels: Optional[int] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    resume: bool = True,
+    checkpoint_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], float]:
     """Profile power for all (or up to max_kernels) unique kernels.
 
-    Measures an idle-power baseline once before iterating kernels.
+    Measures an idle-power baseline once before iterating kernels (unless
+    resuming from a checkpoint that already recorded the baseline).
     Power replay is always serial (single-GPU) — running kernels in parallel
     on separate GPUs would contaminate per-GPU NVML readings.
 
     Args:
         kernel_db_entries: List of kernel DB entry dicts.
-        output_dir:        Directory for replay scripts.
+        output_dir:        Directory for replay scripts and checkpoint file.
         gpu_ids:           GPU indices to sample (default: [0]).
         target_warmup_ms:  Warmup phase target (ms).
         target_meas_ms:    Per-window measurement target (ms).
@@ -559,6 +628,9 @@ def power_profile_all_kernels(
         interval_ms:       NVML polling interval (ms).
         max_kernels:       If set, cap the number of kernels profiled.
         extra_env:         Environment for replay subprocesses.
+        resume:            If True, load ``power_replay_checkpoint.json`` when
+                           present and skip kernels already completed.
+        checkpoint_path:   Override checkpoint path (default: under output_dir).
 
     Returns:
         Tuple of (results_dict, idle_baseline_w) where results_dict maps
@@ -572,10 +644,48 @@ def power_profile_all_kernels(
     if max_kernels is not None:
         entries = entries[:max_kernels]
 
-    # ── Idle baseline measurement ──────────────────────────────────────────
+    ck_path = checkpoint_path if checkpoint_path is not None else _default_checkpoint_path(output_dir)
+    settings_key = _power_replay_settings_key(
+        target_warmup_ms, target_meas_ms, num_windows, interval_ms
+    )
+
+    results: Dict[str, Dict[str, Any]] = {}
     idle_baseline_w = 0.0
+
+    if not resume and ck_path.is_file():
+        try:
+            ck_path.unlink()
+            print(f"  Removed checkpoint (--no-power-replay-resume): {ck_path}")
+        except OSError as exc:
+            print(f"  Warning: could not remove checkpoint {ck_path}: {exc}")
+
+    idle_recorded_from_ckpt = False
+    if resume and ck_path.is_file():
+        loaded, idle_baseline_w, _, idle_recorded_from_ckpt = _load_power_checkpoint(
+            ck_path, settings_key
+        )
+        results = dict(loaded)
+        n_done = len(results)
+        if n_done or idle_recorded_from_ckpt:
+            print(
+                f"  Resuming power replay from checkpoint ({n_done} kernels done): {ck_path}"
+            )
+
+    total = len(entries)
+    n_pending = sum(1 for e in entries if e.get("id") not in results)
+    if n_pending == 0:
+        print(
+            f"\n  Power replay: all {total} kernels already in checkpoint; nothing to do."
+        )
+        return results, idle_baseline_w
+
+    # ── Idle baseline measurement (skip if checkpoint already recorded it) ──
+    need_idle_measure = not (resume and idle_recorded_from_ckpt)
+    if resume and idle_recorded_from_ckpt:
+        print(f"  Using idle baseline from checkpoint: {idle_baseline_w:.1f} W")
+
     _idle_sampler = make_power_sampler(gpu_ids=gpu_ids, interval_ms=interval_ms, enabled=True)
-    if not isinstance(_idle_sampler, _NoOpSampler):
+    if need_idle_measure and not isinstance(_idle_sampler, _NoOpSampler):
         print("  Measuring GPU idle power baseline (1 s)...")
         _idle_sampler.start()
         time.sleep(1.0)
@@ -583,18 +693,34 @@ def power_profile_all_kernels(
         idle_r = _idle_sampler.get_results()
         idle_baseline_w = idle_r.get("mean_power_w", 0.0)
         print(f"  Idle baseline: {idle_baseline_w:.1f} W")
-    else:
+    elif need_idle_measure:
         print(
             "  Warning: NVML unavailable — power replay will return no results. "
             "Install pynvml (pip install pynvml) or ensure nvidia-smi is in PATH."
         )
 
+    def _save_ckpt() -> None:
+        payload = {
+            "version": _CHECKPOINT_VERSION,
+            "settings": settings_key,
+            "idle_baseline_w": idle_baseline_w,
+            "idle_baseline_recorded": True,
+            "kernels": results,
+        }
+        _atomic_write_json(ck_path, payload)
+
     # ── Per-kernel replay ──────────────────────────────────────────────────
     replay_dir = output_dir / "power_replay_scripts"
-    results: Dict[str, Dict[str, Any]] = {}
-    total = len(entries)
+    # Persist idle baseline as soon as it is known so a stop right after idle still resumes.
+    _save_ckpt()
 
-    for i, entry in enumerate(entries, 1):
+    print(f"  Power replay: {n_pending} kernel(s) remaining of {total} total.")
+
+    for idx_in_all, entry in enumerate(entries):
+        kid = entry.get("id")
+        if kid in results:
+            continue
+        i = idx_in_all + 1
         # Periodically re-measure idle baseline to track GPU thermal drift.
         # A drift > 5 W over 10 kernels (~14 s) indicates warm-up effects.
         if i > 1 and (i - 1) % 10 == 0 and not isinstance(
@@ -612,8 +738,8 @@ def power_profile_all_kernels(
                     f"{new_baseline:.1f} W (updating after kernel {i - 1})"
                 )
                 idle_baseline_w = new_baseline
+            _save_ckpt()
 
-        kid = entry["id"]
         kname = entry.get("kernel", {}).get("name", "?")
         op = entry.get("aten_op", {}).get("name", "?")
         print(f"  Power replay [{i}/{total}] {kid}: {op} → {kname[:50]}")
@@ -630,6 +756,7 @@ def power_profile_all_kernels(
         )
         if result is not None:
             results[kid] = result
+            _save_ckpt()
 
     print(
         f"\n  Power replay complete: {len(results)}/{total} kernels profiled"
