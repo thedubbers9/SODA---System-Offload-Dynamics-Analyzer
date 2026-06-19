@@ -136,11 +136,12 @@ class MoEProfilePipeline:
 
         print(f"[MoE CUPTI Profile] Loading model: {self.model_name}")
         dtype = getattr(torch, self.precision, torch.bfloat16)
-        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=dtype,
             device_map="auto",
+            trust_remote_code=True,
         )
         model.eval()
         print(f"[MoE CUPTI Profile] Model loaded on {next(model.parameters()).device}")
