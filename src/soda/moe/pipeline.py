@@ -45,6 +45,7 @@ class MoEProfilePipeline:
         self.precision = getattr(args, "precision", "bfloat16") or "bfloat16"
         self.max_seq_len = getattr(args, "max_seq_len", 4096)
         self.max_new_tokens = getattr(args, "max_new_tokens", 1)
+        self.batch_size = int(getattr(args, "moe_batch_size", 1) or 1)
         self.warmup_iters = getattr(args, "moe_warmup", _DEFAULT_WARMUP)
 
         # Output directory
@@ -94,6 +95,7 @@ class MoEProfilePipeline:
                 max_seq_len=self.max_seq_len,
                 max_new_tokens=self.max_new_tokens,
                 precision=self.precision,
+                batch_size=self.batch_size,
             )
             all_events[name] = events
 

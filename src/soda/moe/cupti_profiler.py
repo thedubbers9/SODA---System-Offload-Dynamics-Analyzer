@@ -601,6 +601,7 @@ def profile_single_prompt(
     max_new_tokens: int = 1,
     device: Optional[torch.device] = None,
     precision: str = "bfloat16",
+    batch_size: int = 1,
 ) -> List[Dict]:
     """Profile a single prompt and return per-operator memory measurements.
 
@@ -643,6 +644,8 @@ def profile_single_prompt(
         truncation=True,
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
+    if batch_size and int(batch_size) > 1:
+        inputs = {k: (v.repeat(int(batch_size), *([1] * (v.dim() - 1))) if hasattr(v, "dim") else v) for k, v in inputs.items()}
 
     # Build profiler config
     exp_config = _try_build_experimental_config()

@@ -899,6 +899,13 @@ def get_args_parser() -> argparse.ArgumentParser:
         help="Number of warmup iterations before CUPTI profiling (default: 0).",
     )
     parser.add_argument(
+        "--moe-batch-size",
+        dest="moe_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for MoE op_profile generation (replicates the prompt; default: 1).",
+    )
+    parser.add_argument(
         "--max-seq-len",
         dest="max_seq_len",
         type=int,
