@@ -1445,6 +1445,7 @@ def main() -> int:
         return 1
     except RuntimeError as e:
         print(f"Error: Runtime error during profiling: {e}", file=sys.stderr)
+        traceback.print_exc()
         return 1
     except Exception as e:
         print(f"Error: Unexpected error: {e}", file=sys.stderr)
